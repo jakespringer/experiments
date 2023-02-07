@@ -27,6 +27,7 @@ class Experiment(list):
         if base_dir is not None:
             print(f'[experiments] Recording experiment in {os.path.join(self.base_dir, self.id)}', file=sys.stderr)
         self.global_params = default_params
+        self.global_params['id'] = self.id
         if init_step: self.step()
 
     def log(self, **values):
