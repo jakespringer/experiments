@@ -109,7 +109,7 @@ class Experiment(list):
     def write_log(self):
         path = self._create_dir()
         np.savez(os.path.join(path, 'log.npz'), np.asarray(self))
-        np.savez(os.path.join(path, 'defaults.npz'), **self.global_params, id=self.id)
+        np.savez(os.path.join(path, 'defaults.npz'), **self.global_params)
 
     def recordz(self, filename=None, prefix=None, **kwargs):
         path = self._create_dir()
@@ -124,7 +124,7 @@ class Experiment(list):
 
 class ExperimentGroup(Experiment):
     def __init__(self, *experiments, id=None, default_params={}, **kwargs):
-        super(ExperimentGroup, self).__init__(id=id, default_params=default_params, init_step=False, **kwargs)
+        super(ExperimentGroup, self).__init__(id=id, default_params=default_params, init_step=False, new_id=False, **kwargs)
         for e in experiments:
             self.extend(e)
 
@@ -134,11 +134,18 @@ class ExperimentGroup(Experiment):
     def step(self):
         raise Exception('Cannot call step on ExperimentGroup')
 
-    def append_experiment(self, base_dir, id):
-        pass
+    def append_experiment(self, id):
+        path = os.path.join(self.base_dir, ex_id)
+        log = np.load(os.path.join(path, 'log.npz'), allow_pickle=True)['arr_0']
+        self.extend(log)
 
-    def read_file(self, file):
-        pass
+    def all_project_experiment_ids(self):
+        possible_dirs = os.listdir(self.base_dir)
+        dirs = [d for d in possible_dirs if 'defaults.npz' in os.listdir(os.path.join(self.base_dir, d))]
+        return dirs
+
+    def read_file(self, id, file, allow_pickle=True):
+        return np.load(os.path.join(self.base_dir, id, file))
 
 def Leq(x):
     return lambda y: y <= x
@@ -196,6 +203,7 @@ def new_experiment(id, default_params={}, base_dir={}, **kwargs):
     try:
         yield experiment
     finally:
+        if experiment.base_dir is not None: experiment.write_log()
         global_experiment = old_experiment
 
 def log(**values):
@@ -221,3 +229,9 @@ def recordz(**kwargs):
 
 def file_abspath(file):
     return global_experiment.file_abspath(file)
+
+def load_project(id, base_dir, **kwargs):
+    prj = ExperimentGroup(id=id, base_dir=base_dir, **kwargs)
+    for ex_id in prj.all_project_experiment_ids():
+        prj.append_experiment(ex_id)
+    return prj
