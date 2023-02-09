@@ -4,6 +4,7 @@ import os
 import sys
 import time
 import itertools
+from tqdm import tqdm
 from contextlib import contextmanager
 
 global_experiment = None
@@ -126,7 +127,7 @@ class ExperimentGroup(Experiment):
     def __init__(self, *experiments, id=None, default_params={}, **kwargs):
         super(ExperimentGroup, self).__init__(id=id, default_params=default_params, init_step=False, new_id=False, **kwargs)
         for e in experiments:
-            self.extend(e)
+            self.append_experiment(e)
 
     def log(self, **values):
         raise Exception('Cannot call log on ExperimentGroup')
@@ -134,10 +135,12 @@ class ExperimentGroup(Experiment):
     def step(self):
         raise Exception('Cannot call step on ExperimentGroup')
 
+    def read_experiment(self, id):
+        path = os.path.join(self.base_dir, id)
+        return np.load(os.path.join(path, 'log.npz'), allow_pickle=True)['arr_0']
+
     def append_experiment(self, id):
-        path = os.path.join(self.base_dir, ex_id)
-        log = np.load(os.path.join(path, 'log.npz'), allow_pickle=True)['arr_0']
-        self.extend(log)
+        self.extend(self.read_experiment(id))
 
     def all_project_experiment_ids(self):
         possible_dirs = os.listdir(self.base_dir)
@@ -146,6 +149,30 @@ class ExperimentGroup(Experiment):
 
     def read_file(self, id, file, allow_pickle=True):
         return np.load(os.path.join(self.base_dir, id, file))
+
+class LazyExperimentGroup(ExperimentGroup):
+    def __init__(self, *experiments, use_tqdm=False, **kwargs):
+        super(LazyExperimentGroup, self).__init__(*experiments, **kwargs)
+        self.experiment_ids = []
+        self.use_tqdm = use_tqdm
+
+    def append_experiment(self, id):
+        self.experiment_ids.append(id)
+
+    def __iter__(self):
+        if self.use_tqdm:
+            experiment_ids = tqdm(self.experiment_ids)
+        else:
+            experiment_ids = self.experiment_ids
+        for ex_id in experiment_ids:
+            for y in self.read_experiment(ex_id):
+                yield y
+
+    def __getitem__(self, idx):
+        raise NotImplementedError
+
+    def __setitem__(self, idx):
+        raise NotImplementedErorr
 
 def Leq(x):
     return lambda y: y <= x
@@ -230,8 +257,13 @@ def recordz(**kwargs):
 def file_abspath(file):
     return global_experiment.file_abspath(file)
 
-def load_project(id, base_dir, **kwargs):
-    prj = ExperimentGroup(id=id, base_dir=base_dir, **kwargs)
-    for ex_id in prj.all_project_experiment_ids():
+def load_project(id, base_dir, use_tqdm=False, lazy=False, **kwargs):
+    if lazy:
+        prj = LazyExperimentGroup(id=id, base_dir=base_dir, use_tqdm=use_tqdm and lazy, **kwargs)
+    else:
+        prj = ExperimentGroup(id=id, base_dir=base_dir, **kwargs)
+    ids = prj.all_project_experiment_ids()
+    if use_tqdm and not lazy: ids = tqdm(ids)
+    for ex_id in ids:
         prj.append_experiment(ex_id)
     return prj
