@@ -23,8 +23,8 @@ class Experiment(list):
         if new_id:
             new_id = self._find_new_id()
             if new_id is not None:
+                print(f'[experiments] Requested id already exists: {self.id}', file=sys.stderr)
                 self.id = new_id
-                print(f'[experiments] Requested id already exists: updating to be {self.id}', file=sys.stderr)
         if base_dir is not None:
             print(f'[experiments] Recording experiment in {os.path.join(self.base_dir, self.id)}', file=sys.stderr)
         self.global_params = default_params
