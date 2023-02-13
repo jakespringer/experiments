@@ -9,7 +9,6 @@ from contextlib import contextmanager
 
 global_experiment = None
 re_brackets = re.compile(r'(.+)\[((?:-?)[0-9]+)\]')
-year_in_ms = 31_540_000_000_000
 
 def _reorder_list(lst, ord):
     return [lst[i] for i in ord]
@@ -113,12 +112,22 @@ class Experiment(list):
         np.savez(os.path.join(path, 'defaults.npz'), **self.global_params)
 
     def recordz(self, filename=None, prefix=None, **kwargs):
-        path = self._create_dir()
-        if filename is None:
-            filename = 'record' if prefix is None else prefix
-            filename = f'{filename}_{(time.time_ns() // 1000) % year_in_ms}.npz'
+        self.request_filename(filename=filename, prefix=None, postfix='npz')
         np.savez(os.path.join(path, filename), **kwargs)
         return filename
+
+    def request_filename(filename=None, prefix=None, postfix=None):
+        path = self._create_dir()
+        if filename is None:
+            if postfix is None:
+                postfix = ''
+            elif not postfix.startswith('.'):
+                postfix = f'.{postfix}' 
+            prefix = 'record' if prefix is None else prefix
+            filename = f'{prefix}{time.time_ns()}{postfix}'
+            return os.path.join(path, filename)
+        else:
+            return os.path.join(path, filename)
 
     def file_abspath(self, file):
         return os.path.join(self.base_dir, self.id, file)
