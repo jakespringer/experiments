@@ -116,7 +116,7 @@ class Experiment(list):
         np.savez(os.path.join(path, filename), **kwargs)
         return filename
 
-    def request_filename(filename=None, prefix=None, postfix=None):
+    def request_filename(self, filename=None, prefix=None, postfix=None):
         path = self._create_dir()
         if filename is None:
             if postfix is None:
@@ -262,6 +262,9 @@ def write_log():
 
 def recordz(**kwargs):
     return global_experiment.recordz(**kwargs)
+
+def request_filename(filename=None, prefix=None, postfix=None):
+    return global_experiment.request_filename(filename=filename, prefix=prefix, postfix=postfix)
 
 def file_abspath(file):
     return global_experiment.file_abspath(file)
