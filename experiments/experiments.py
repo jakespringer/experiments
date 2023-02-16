@@ -111,10 +111,10 @@ class Experiment(list):
         np.savez(os.path.join(path, 'log.npz'), np.asarray(self))
         np.savez(os.path.join(path, 'defaults.npz'), **self.global_params)
 
-    def recordz(self, filename=None, prefix=None, **kwargs):
-        self.request_filename(filename=filename, prefix=None, postfix='npz')
-        np.savez(os.path.join(path, filename), **kwargs)
-        return filename
+    # def recordz(self, filename=None, prefix=None, **kwargs):
+    #     self.request_filename(filename=filename, prefix=None, postfix='npz')
+    #     np.savez(os.path.join(path, filename), **kwargs)
+    #     return filename
 
     def request_filename(self, filename=None, prefix=None, postfix=None):
         path = self._create_dir()
@@ -125,9 +125,9 @@ class Experiment(list):
                 postfix = f'.{postfix}' 
             prefix = 'record' if prefix is None else prefix
             filename = f'{prefix}{time.time_ns()}{postfix}'
-            return os.path.join(path, filename)
+            return filename, os.path.join(path, filename)
         else:
-            return os.path.join(path, filename)
+            return filename, os.path.join(path, filename)
 
     def file_abspath(self, file):
         return os.path.join(self.base_dir, self.id, file)
@@ -251,7 +251,7 @@ def step():
 def update_default(params):
     global_experiment.global_params.update(params)
 
-def query(*vargs, constraints):
+def query(*vargs, constraints=None):
     return global_experiment.query(*vargs, constraints=constraints)
 
 def get_param(k):
