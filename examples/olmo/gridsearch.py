@@ -229,6 +229,10 @@ class PretrainedModel(Artifact):
     
     @property
     def relpath(self) -> str:
+        return f'PretrainedModel/{self.run_name}'
+
+    @property
+    def run_name(self) -> str:
         return f'OLMo-20M-{self.tokens_b}B-{self.optimizer}'
     
     def get_requirements(self):
@@ -241,7 +245,7 @@ class PretrainedModel(Artifact):
         }
     
     def construct(self, builder: Task):
-        run_name = f'OLMo-20M-{self.tokens_b}B-Pretrain-{self.optimizer}'
+        run_name = self.run_name
         save_folder = os.path.join(builder.artifact_path, self.relpath)
         
         # Create pretrain config using unified helper function
@@ -282,13 +286,16 @@ class PretrainedModel(Artifact):
 class CPTModel(Artifact):
     """Continued pretraining model."""
     pretrained: PretrainedModel
-    tokens_b: int          # 4, 8, 16, 32, 64 (billions)
     learning_rate: float   # 1e-3, 2e-4, 4e-5
     
     @property
     def relpath(self) -> str:
+        return f'CPTModel/{self.run_name}'
+
+    @property
+    def run_name(self) -> str:
         lr_str = f'{self.learning_rate:.0e}'.replace('e-0', 'e-')
-        return f'OLMo-20M-{self.tokens_b}B-{self.pretrained.optimizer}-lr{lr_str}'
+        return f'{self.pretrained.run_name}-lr{lr_str}'
     
     def get_requirements(self):
         return {
@@ -300,8 +307,7 @@ class CPTModel(Artifact):
         }
     
     def construct(self, builder: Task):
-        lr_str = f'{self.learning_rate:.0e}'.replace('e-0', 'e-')
-        run_name = f'OLMo-20M-{self.tokens_b}B-CPT-{self.pretrained.optimizer}-lr{lr_str}'
+        run_name = self.run_name
         save_folder = os.path.join(builder.artifact_path, self.relpath)
         
         # Get checkpoint path from pretrained model
@@ -316,7 +322,7 @@ class CPTModel(Artifact):
             run_name=run_name,
             save_folder=save_folder,
             optimizer=self.pretrained.optimizer,
-            max_duration=f'{self.tokens_b}e7T',
+            max_duration=f'2e7T',
             train_data_paths=CPT_DATA_PATHS,
             eval_datasets=EVAL_DATASETS,
             learning_rate=self.learning_rate,
@@ -362,7 +368,6 @@ cpt_models = pretrained_models.map_flatten(
         cls=CPTModel,
         params={
             'pretrained': pretrained,
-            'tokens_b': [4, 8, 16, 32, 64],
             'learning_rate': [1e-3, 2e-4, 4e-5],
         }
     )
