@@ -25,6 +25,7 @@ class PretrainedModel(Artifact):
 
     def get_requirements(self):
         return {
+            'partition': 'array',
             'gpus': 'A6000:4',
             'cpus': '8',
         }
@@ -53,16 +54,22 @@ class PretrainedModel(Artifact):
             vformat='{v}',
             kwformat='--{k} \'{v}\'',
         )
-        builder.upload_to_gs(
-            os.path.join(builder.artifact_path, self.relpath),
-            os.path.join(builder.gs_path, self.relpath),
-        )
+        # builder.upload_to_gs(
+        #     os.path.join(builder.artifact_path, self.relpath),
+        #     os.path.join(builder.gs_path, self.relpath),
+        # )
 
 
 @dataclass(frozen=True)
 class FinetuningDataset(Artifact):
     dataset_name: str
     dataset_path: str
+
+    def get_requirements(self):
+        return {
+            'partition': 'cpu',
+            'cpus': '1',
+        }
 
     @property
     def path(self) -> str:
@@ -97,6 +104,7 @@ class FinetunedModel(Artifact):
 
     def get_requirements(self):
         return {
+            'partition': 'array',
             'gpus': 'A6000:1',
             'cpus': '2',
         }
@@ -121,10 +129,10 @@ class FinetunedModel(Artifact):
             vformat='{v}',
             kwformat='--{k} \'{v}\'',
         )
-        builder.upload_to_gs(
-            os.path.join(builder.artifact_path, self.relpath),
-            os.path.join(builder.gs_path, self.relpath),
-        )
+        # builder.upload_to_gs(
+        #     os.path.join(builder.artifact_path, self.relpath),
+        #     os.path.join(builder.gs_path, self.relpath),
+        # )
 
 pretrained_models = ArtifactSet.from_product(
     cls=PretrainedModel,
@@ -170,7 +178,8 @@ finetuned_models = ArtifactSet.join_product(pretrained_models, finetuning_datase
 )
 
 executor = SlurmExecutor(
-    artifact_path='/user_data/jspringe/projects/dummy',
+    project='dummy',
+    artifact_path='/data/user_data/jspringe/outputs/dummy',
     code_path='/home/jspringe/projects/dummy/src',
     gs_path='gs://jspringe/projects/dummy',
 )

@@ -297,9 +297,12 @@ class Executor:
             print("No artifacts matched the selected stages.")
             return
 
+        # Build mapping of tier index to stage names
+        tier_to_stages = self._build_tier_to_stages_mapping(filtered_tiers, stages)
+        
         # Compile and launch
         task_tiers = [[self.compile_artifact(a) for a in tier] for tier in filtered_tiers]
-        self.launch(task_tiers)
+        self.launch(task_tiers, tier_to_stages=tier_to_stages)
 
     def _validate_and_normalize_stages(self, stages: List[str]) -> List[str]:
         """Validate stage names and return normalized list (all stages if empty)."""
@@ -351,6 +354,42 @@ class Executor:
                 filtered_tiers.append(filtered_tier)
         
         return filtered_tiers
+    
+    def _build_tier_to_stages_mapping(
+        self,
+        tiers: List[List[Artifact]],
+        selected_stages: List[str],
+    ) -> Dict[int, List[str]]:
+        """Build mapping from tier index to list of stage names.
+        
+        Args:
+            tiers: Filtered list of artifact tiers
+            selected_stages: List of selected stage names
+            
+        Returns:
+            Dictionary mapping tier index to list of stage names containing
+            artifacts in that tier
+        """
+        # Build membership map: artifact ID -> set of stage names
+        artifact_to_stages: Dict[int, Set[str]] = {}
+        for stage_name, artifacts in self._stages.items():
+            for artifact in artifacts:
+                artifact_to_stages.setdefault(id(artifact), set()).add(stage_name)
+        
+        # Build tier to stages mapping
+        tier_to_stages: Dict[int, List[str]] = {}
+        selected_set = set(selected_stages)
+        
+        for tier_index, tier in enumerate(tiers):
+            # Collect all stage names for artifacts in this tier
+            stages_in_tier: Set[str] = set()
+            for artifact in tier:
+                stages_in_tier.update(
+                    artifact_to_stages.get(id(artifact), set()) & selected_set
+                )
+            tier_to_stages[tier_index] = sorted(stages_in_tier)
+        
+        return tier_to_stages
 
     def compute_topological_ordering(
         self,
@@ -456,7 +495,7 @@ class Executor:
 
         return tiers
 
-    def launch(self, tiers: List[List[Task]]) -> None:
+    def launch(self, tiers: List[List[Task]], tier_to_stages: Dict[int, List[str]] | None = None) -> None:
         raise NotImplementedError
 
     def compile_artifact(self, artifact: Artifact) -> Task:
@@ -488,7 +527,7 @@ class PrintExecutor(Executor):
         artifact.construct(task)
         return task
 
-    def launch(self, tiers: List[List[Task]]) -> None:
+    def launch(self, tiers: List[List[Task]], tier_to_stages: Dict[int, List[str]] | None = None) -> None:
         """Print all shell commands that would be executed."""
         for tier in tiers:
             for task in tier:
@@ -510,6 +549,7 @@ class SlurmExecutor(Executor):
         self,
         artifact_path: str,
         code_path: str,
+        project: str | None = None,
         gs_path: str | None = None,
         default_slurm_args: Dict[str, Any] | None = None,
         dry_run: bool = False,
@@ -517,32 +557,20 @@ class SlurmExecutor(Executor):
         super().__init__()
         self.artifact_path = Path(artifact_path)
         self.code_path = Path(code_path)
+        self.project = project
         self.gs_path = gs_path
         self.default_slurm_args = default_slurm_args or {}
+        self.default_slurm_args_by_partition: Dict[str, Dict[str, Any]] = {}
         self.dry_run = dry_run
         self._next_fake_job_id = 1000  # For dry run mode
         self._dry_run_jobs: List[Dict[str, Any]] = []  # Store job info for dry run summary
+        self.config_manager: Any = None  # Will be set by CLI
+        self.config: Dict[str, Any] = {}
 
     def auto_cli(self) -> None:
-        """Parse command-line arguments including --dry flag and execute selected stages."""
-        parser = argparse.ArgumentParser(description="Experiment executor (Slurm)")
-        parser.add_argument(
-            "stages",
-            nargs="*",
-            help="Optional stage names to run; omit to run all registered stages",
-        )
-        parser.add_argument(
-            "--dry",
-            action="store_true",
-            help="Dry run mode: show what would be submitted without actually submitting jobs",
-        )
-        args = parser.parse_args()
-        
-        # Set dry run mode based on CLI flag
-        self.dry_run = args.dry
-        
-        selected = list(args.stages) if args.stages else list(self._stages.keys())
-        self.execute(selected)
+        """Launch the CLI interface for this executor."""
+        from .cli import auto_cli
+        auto_cli(self)
 
     def compile_artifact(self, artifact: Artifact) -> Task:
         """Compile an artifact into a task by calling its construct method."""
@@ -555,18 +583,31 @@ class SlurmExecutor(Executor):
         artifact.construct(task)
         return task
 
-    def launch(self, tiers: List[List[Task]]) -> None:
-        """Submit each tier as one or more Slurm array jobs with proper dependencies."""
+    def launch(self, tiers: List[List[Task]], tier_to_stages: Dict[int, List[str]] | None = None) -> None:
+        """Submit each tier as one or more Slurm array jobs with proper dependencies.
+        
+        Args:
+            tiers: List of task tiers to execute
+            tier_to_stages: Optional mapping from tier index to list of stage names
+        """
         previous_tier_job_ids: List[str] = []
+        all_job_ids: List[str] = []
         
         if self.dry_run:
             print("\n" + "=" * 100)
             print("DRY RUN MODE - No jobs will be submitted")
             print("=" * 100 + "\n")
+        else:
+            print("\n" + "=" * 80)
+            print("Launching Jobs")
+            print("=" * 80 + "\n")
         
         for tier_index, tier in enumerate(tiers):
             if not tier:
                 continue
+            
+            # Determine stage names for this tier
+            stage_names = tier_to_stages.get(tier_index, []) if tier_to_stages else []
             
             # Submit this tier (may create multiple jobs if requirements differ)
             # and get all job IDs created
@@ -574,7 +615,11 @@ class SlurmExecutor(Executor):
                 tier_index,
                 tier,
                 dependency_job_ids=previous_tier_job_ids,
+                stage_names=stage_names,
             )
+            
+            # Track all submitted jobs
+            all_job_ids.extend(current_tier_job_ids)
             
             # These jobs become dependencies for the next tier
             previous_tier_job_ids = current_tier_job_ids
@@ -582,12 +627,16 @@ class SlurmExecutor(Executor):
         # Print summary for dry run
         if self.dry_run:
             self._print_dry_run_summary()
+        else:
+            # Print final summary for actual launch
+            self._print_launch_summary(all_job_ids)
 
     def _submit_tier(
         self,
         tier_index: int,
         tier: List[Task],
         dependency_job_ids: List[str],
+        stage_names: List[str] | None = None,
     ) -> List[str]:
         """Submit a tier as one or more Slurm array jobs.
         
@@ -595,9 +644,17 @@ class SlurmExecutor(Executor):
         as separate jobs. All jobs in this tier depend on all jobs from the
         previous tier.
         
+        Args:
+            tier_index: Index of the tier
+            tier: List of tasks in the tier
+            dependency_job_ids: Job IDs this tier depends on
+            stage_names: Optional list of stage names for this tier
+        
         Returns:
             List of job IDs created for this tier
         """
+        from datetime import datetime
+        
         # Group tasks by their requirements
         task_groups = self._group_tasks_by_requirements(tier)
         
@@ -628,38 +685,95 @@ class SlurmExecutor(Executor):
             job_id = self._submit_sbatch_script(script_path)
             submitted_job_ids.append(job_id)
             
+            # Extract log file from header
+            log_file = None
+            for line in sbatch_header:
+                if line.startswith("#SBATCH --output="):
+                    log_file = line.split("=", 1)[1]
+                    break
+            
+            # Collect artifact class names
+            artifact_classes = [
+                task.artifact.__class__.__name__ 
+                for task in tasks 
+                if task.artifact is not None
+            ]
+            
+            # Build job info
+            job_info = {
+                'job_id': job_id,
+                'job_name': job_name,
+                'tier': tier_index,
+                'group': group_index,
+                'num_tasks': len(tasks),
+                'artifact_classes': artifact_classes,
+                'config': slurm_config,
+                'dependencies': list(dependency_job_ids),
+                'script_path': script_path,
+                'log_file': log_file,
+                'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            
             # Store job info for dry run summary
             if self.dry_run:
-                # Collect artifact class names
-                artifact_classes = [
-                    task.artifact.__class__.__name__ 
-                    for task in tasks 
-                    if task.artifact is not None
-                ]
-                
-                self._dry_run_jobs.append({
-                    'job_id': job_id,
-                    'job_name': job_name,
-                    'tier': tier_index,
-                    'group': group_index,
-                    'num_tasks': len(tasks),
-                    'artifact_classes': artifact_classes,
-                    'config': slurm_config,
-                    'dependencies': list(dependency_job_ids),
-                    'script_path': script_path,
-                })
+                self._dry_run_jobs.append(job_info)
             
-            # Print for inspection (more detailed in non-dry-run mode)
+            # Save job info to persistent storage (if config manager available and project set)
+            if self.config_manager and self.project and not self.dry_run:
+                # Determine which stage this specific group belongs to
+                # by checking which stage the artifacts in this group belong to
+                group_stage = self._determine_group_stage(tasks, stage_names)
+                if group_stage:
+                    self.config_manager.save_job_info(self.project, group_stage, job_info)
+            
+            # Print brief summary (not in dry run mode)
             if not self.dry_run:
-                print('=' * 100)
-                print(f"Submitted job {job_id}: {job_name}")
-                print('\n'.join(sbatch_header))
-                print('\n\n')
-                print('\n'.join(script_body))
-                print(f"Script: {script_path}")
+                # Get unique artifact types
+                artifact_types = sorted(set(artifact_classes))
+                artifact_summary = ', '.join(artifact_types) if artifact_types else 'N/A'
+                
+                print(f"✓ Submitted job {job_id}: {job_name}")
+                print(f"  Tasks: {len(tasks)}, Artifacts: {artifact_summary}")
+                print(f"  Config: partition={slurm_config.get('partition', 'N/A')}, "
+                      f"cpus={slurm_config.get('cpus', 'N/A')}, "
+                      f"gpus={slurm_config.get('gpus', 'N/A')}, "
+                      f"time={slurm_config.get('time', 'N/A')}")
                 print()
         
         return submitted_job_ids
+    
+    def _determine_group_stage(self, tasks: List[Task], stage_names: List[str]) -> str | None:
+        """Determine which stage this group of tasks belongs to.
+        
+        Args:
+            tasks: List of tasks in this group
+            stage_names: Possible stage names for this tier
+            
+        Returns:
+            The stage name that best represents this group, or None
+        """
+        if not tasks or not stage_names:
+            return None
+        
+        # Count which stage each artifact in this group belongs to
+        stage_counts: Dict[str, int] = defaultdict(int)
+        
+        for task in tasks:
+            if task.artifact is not None:
+                # Find which stage(s) contain this artifact
+                artifact_id = id(task.artifact)
+                for stage_name in stage_names:
+                    if stage_name in self._stages:
+                        stage_artifacts = self._stages[stage_name]
+                        if any(id(a) == artifact_id for a in stage_artifacts):
+                            stage_counts[stage_name] += 1
+        
+        # Return the stage with the most artifacts in this group
+        if stage_counts:
+            return max(stage_counts.items(), key=lambda x: x[1])[0]
+        
+        # Fallback to first stage name
+        return stage_names[0] if stage_names else None
 
     def _group_tasks_by_requirements(
         self,
@@ -702,15 +816,39 @@ class SlurmExecutor(Executor):
         except Exception:
             reqs = {}
         
-        # Merge with defaults
+        # Start with global defaults
         config: Dict[str, Any] = {}
         config.update(self.default_slurm_args)
+        
+        # Apply partition-specific defaults from config
+        partition = reqs.get('partition', config.get('partition', 'general'))
+        if partition in self.default_slurm_args_by_partition:
+            config.update(self.default_slurm_args_by_partition[partition])
+        
+        # Apply artifact-specific requirements (highest priority)
         config.update(reqs)
         
         # Apply reasonable defaults
         config.setdefault('partition', 'general')
-        config.setdefault('time', '1-00:00:00')
-        config.setdefault('cpus', 1)
+        config.setdefault('time', '2-00:00:00')  # 2 days default
+        
+        # Set default cpus to match number of GPUs
+        if 'cpus' not in config and 'gpus' in config:
+            # Extract GPU count from gpus value
+            gpus_val = str(config['gpus'])
+            if ':' in gpus_val:
+                # Format like "A6000:4" - extract the number after colon
+                gpu_count = int(gpus_val.split(':')[-1])
+            else:
+                # Just a number
+                try:
+                    gpu_count = int(gpus_val)
+                except ValueError:
+                    # Single GPU model name like "A6000"
+                    gpu_count = 1
+            config.setdefault('cpus', gpu_count)
+        else:
+            config.setdefault('cpus', 1)
         
         return config
 
@@ -734,6 +872,14 @@ class SlurmExecutor(Executor):
         # Job name
         lines.append(f"#SBATCH --job-name={job_name}")
         
+        # Log file paths
+        log_dir = self.config.get('log_directory', str(Path.home() / ".experiments" / "logs"))
+        Path(log_dir).mkdir(parents=True, exist_ok=True)
+        
+        log_file = f"{log_dir}/{job_name}_%A_%a.log"
+        lines.append(f"#SBATCH --output={log_file}")
+        lines.append(f"#SBATCH --error={log_file}")
+        
         # Dependencies: wait for all previous tier jobs to complete successfully
         if dependency_job_ids:
             dependency_str = ":".join(dependency_job_ids)
@@ -747,16 +893,19 @@ class SlurmExecutor(Executor):
         if 'cpus' in config:
             lines.append(f"#SBATCH --cpus-per-task={config['cpus']}")
         
-        # GPU handling: distinguish between model-specific (GRES) and count-only
+        # QOS (Quality of Service)
+        if 'qos' in config:
+            lines.append(f"#SBATCH --qos={config['qos']}")
+        
+        # Requeue flag
+        if config.get('requeue', False):
+            lines.append(f"#SBATCH --requeue")
+        
+        # GPU handling: use --gpus format for all cases
         gpus_val = config.get('gpus')
         if gpus_val is not None:
             gpus_str = str(gpus_val)
-            if ':' in gpus_str:
-                # Format like "a100:2" - use GRES syntax
-                lines.append(f"#SBATCH --gres=gpu:{gpus_str}")
-            else:
-                # Just a number - use simple GPU count
-                lines.append(f"#SBATCH --gpus={gpus_str}")
+            lines.append(f"#SBATCH --gpus={gpus_str}")
         
         # Array specification
         max_index = len(tasks) - 1
@@ -938,3 +1087,20 @@ class SlurmExecutor(Executor):
         print("=" * 100)
         print("To actually submit these jobs, run without the --dry flag")
         print("=" * 100 + "\n")
+    
+    def _print_launch_summary(self, job_ids: List[str]) -> None:
+        """Print a brief summary of jobs that were actually launched."""
+        if not job_ids:
+            print("\nNo jobs were submitted.\n")
+            return
+        
+        print("=" * 80)
+        print("Launch Summary")
+        print("=" * 80)
+        print()
+        print(f"Total jobs submitted: {len(job_ids)}")
+        print(f"Job IDs: {', '.join(job_ids)}")
+        print()
+        print("Use 'python <script> history' to view full details")
+        print("Use 'python <script> cat <job_id>' to view logs")
+        print("=" * 80 + "\n")
