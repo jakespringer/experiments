@@ -143,6 +143,49 @@ class ArtifactSet(Sequence[Any]):
                 mapped.append(fn(item))
         return ArtifactSet(mapped)
 
+    def map_flatten(self, fn: Callable[..., "ArtifactSet"]) -> "ArtifactSet":
+        """Map a function across items and flatten the results.
+
+        The function should return an ArtifactSet for each item. All resulting
+        ArtifactSets will be flattened into a single ArtifactSet.
+
+        - If an item is a tuple, it will be splatted into the function.
+        - Otherwise, the item is passed as a single argument.
+        """
+        flattened: List[Any] = []
+        for item in self._items:
+            if isinstance(item, tuple):
+                result = fn(*item)
+            else:
+                result = fn(item)
+            
+            if isinstance(result, ArtifactSet):
+                flattened.extend(result)
+            else:
+                # If not an ArtifactSet, treat as a single item
+                flattened.append(result)
+        return ArtifactSet(flattened)
+
+    def map_reduce(self, map_fn: Callable[..., Any], reduce_fn: Callable[[List[Any]], Any]) -> Any:
+        """Map a function across items and reduce the results.
+
+        First applies map_fn to each item, then applies reduce_fn to the list of results.
+
+        Args:
+            map_fn: Function to apply to each item (or tuple of items)
+            reduce_fn: Function to reduce the mapped results to a single value
+
+        Returns:
+            The reduced value
+        """
+        mapped: List[Any] = []
+        for item in self._items:
+            if isinstance(item, tuple):
+                mapped.append(map_fn(*item))
+            else:
+                mapped.append(map_fn(item))
+        return reduce_fn(mapped)
+
 
 class ArgumentProduct:
     """Utility to build cartesian products of named argument values."""
