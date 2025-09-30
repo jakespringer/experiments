@@ -162,17 +162,14 @@ pretrained_models = ArtifactSet.from_product(
 )
 
 # Create CPT models: each pretrained model x 5 token counts x 3 learning rates
-cpt_models = []
-for pretrained in pretrained_models:
-    for tokens_b in [4, 8, 16, 32, 64]:
-        for lr in [1e-3, 2e-4, 4e-5]:
-            cpt_models.append(CPTModel(
-                pretrained=pretrained,
-                tokens_b=tokens_b,
-                learning_rate=lr,
-            ))
-
-cpt_models = ArtifactSet(cpt_models)
+cpt_models = ArtifactSet.from_product(
+    cls=CPTModel,
+    params={
+        'pretrained': pretrained_models,
+        'tokens_b': [4, 8, 16, 32, 64],
+        'learning_rate': [1e-3, 2e-4, 4e-5],
+    }
+)
 
 # Setup executor
 executor = SlurmExecutor(
