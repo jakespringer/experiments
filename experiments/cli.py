@@ -29,6 +29,7 @@ class ConfigManager:
             # Create default config
             default_config = {
                 "log_directory": str(self.config_dir / "logs"),
+                "default_partition": "general",
                 "default_slurm_args": {
                     "general": {
                         "time": "2-00:00:00",
@@ -54,7 +55,15 @@ class ConfigManager:
             
             return default_config
         
-        return self.load_config()
+        # Load existing config
+        config = self.load_config()
+        
+        # Migrate: add default_partition if it doesn't exist
+        if "default_partition" not in config:
+            config["default_partition"] = "general"
+            self.save_config(config)
+        
+        return config
     
     def load_config(self) -> Dict[str, Any]:
         """Load configuration from file."""
@@ -124,6 +133,26 @@ class ConfigManager:
                             jobs.extend(stage_jobs)
         
         return jobs
+    
+    def get_canceled_jobs_file(self, project: str) -> Path:
+        """Get the path to the canceled jobs tracking file."""
+        return self.get_project_dir(project) / "canceled_jobs.json"
+    
+    def load_canceled_jobs(self, project: str) -> set:
+        """Load the set of canceled job IDs."""
+        canceled_file = self.get_canceled_jobs_file(project)
+        if canceled_file.exists():
+            with open(canceled_file, 'r') as f:
+                return set(json.load(f))
+        return set()
+    
+    def save_canceled_job(self, project: str, job_id: str) -> None:
+        """Mark a job as canceled."""
+        canceled_jobs = self.load_canceled_jobs(project)
+        canceled_jobs.add(job_id)
+        canceled_file = self.get_canceled_jobs_file(project)
+        with open(canceled_file, 'w') as f:
+            json.dump(sorted(canceled_jobs), f, indent=2)
 
 
 class ExperimentCLI:
@@ -150,6 +179,34 @@ class ExperimentCLI:
             nargs='*',
             help='Stage names to run (omit for all stages)'
         )
+        launch_parser.add_argument(
+            '--head',
+            type=int,
+            metavar='N',
+            help='Only launch the first N artifacts'
+        )
+        launch_parser.add_argument(
+            '--tail',
+            type=int,
+            metavar='N',
+            help='Only launch the last N artifacts'
+        )
+        launch_parser.add_argument(
+            '--rerun',
+            action='store_true',
+            help='Ignore exists check and rerun all artifacts'
+        )
+        launch_parser.add_argument(
+            '--reverse',
+            action='store_true',
+            help='Launch stages in reverse order (respects dependencies)'
+        )
+        launch_parser.add_argument(
+            '--exclude',
+            nargs='+',
+            metavar='STAGE',
+            help='Stage names to exclude from execution'
+        )
         
         # drylaunch command
         drylaunch_parser = subparsers.add_parser('drylaunch', help='Dry run: show what would be launched')
@@ -157,6 +214,34 @@ class ExperimentCLI:
             'stages',
             nargs='*',
             help='Stage names to run (omit for all stages)'
+        )
+        drylaunch_parser.add_argument(
+            '--head',
+            type=int,
+            metavar='N',
+            help='Only launch the first N artifacts'
+        )
+        drylaunch_parser.add_argument(
+            '--tail',
+            type=int,
+            metavar='N',
+            help='Only launch the last N artifacts'
+        )
+        drylaunch_parser.add_argument(
+            '--rerun',
+            action='store_true',
+            help='Ignore exists check and rerun all artifacts'
+        )
+        drylaunch_parser.add_argument(
+            '--reverse',
+            action='store_true',
+            help='Launch stages in reverse order (respects dependencies)'
+        )
+        drylaunch_parser.add_argument(
+            '--exclude',
+            nargs='+',
+            metavar='STAGE',
+            help='Stage names to exclude from execution'
         )
         
         # cancel command
@@ -175,6 +260,42 @@ class ExperimentCLI:
         # history command
         subparsers.add_parser('history', help='Show launch history')
         
+        # print command
+        print_parser = subparsers.add_parser('print', help='Print commands to run sequentially (can be piped to bash)')
+        print_parser.add_argument(
+            'stages',
+            nargs='*',
+            help='Stage names to run (omit for all stages)'
+        )
+        print_parser.add_argument(
+            '--head',
+            type=int,
+            metavar='N',
+            help='Only print the first N artifacts'
+        )
+        print_parser.add_argument(
+            '--tail',
+            type=int,
+            metavar='N',
+            help='Only print the last N artifacts'
+        )
+        print_parser.add_argument(
+            '--rerun',
+            action='store_true',
+            help='Ignore exists check and rerun all artifacts'
+        )
+        print_parser.add_argument(
+            '--reverse',
+            action='store_true',
+            help='Print stages in reverse order (respects dependencies)'
+        )
+        print_parser.add_argument(
+            '--exclude',
+            nargs='+',
+            metavar='STAGE',
+            help='Stage names to exclude from execution'
+        )
+        
         args = parser.parse_args()
         
         if not args.command:
@@ -183,17 +304,19 @@ class ExperimentCLI:
         
         # Route to appropriate handler
         if args.command == 'launch':
-            self.launch(args.stages, dry_run=False)
+            self.launch(args.stages, dry_run=False, head=getattr(args, 'head', None), tail=getattr(args, 'tail', None), rerun=getattr(args, 'rerun', False), reverse=getattr(args, 'reverse', False), exclude=getattr(args, 'exclude', None))
         elif args.command == 'drylaunch':
-            self.launch(args.stages, dry_run=True)
+            self.launch(args.stages, dry_run=True, head=getattr(args, 'head', None), tail=getattr(args, 'tail', None), rerun=getattr(args, 'rerun', False), reverse=getattr(args, 'reverse', False), exclude=getattr(args, 'exclude', None))
         elif args.command == 'cancel':
             self.cancel(args.stages)
         elif args.command == 'cat':
             self.cat(args.job_spec, args.array_index)
         elif args.command == 'history':
             self.history()
+        elif args.command == 'print':
+            self.print_commands(args.stages, head=getattr(args, 'head', None), tail=getattr(args, 'tail', None), rerun=getattr(args, 'rerun', False), reverse=getattr(args, 'reverse', False), exclude=getattr(args, 'exclude', None))
     
-    def launch(self, stages: List[str], dry_run: bool = False) -> None:
+    def launch(self, stages: List[str], dry_run: bool = False, head: Optional[int] = None, tail: Optional[int] = None, rerun: bool = False, reverse: bool = False, exclude: Optional[List[str]] = None) -> None:
         """Launch experiment stages."""
         # Apply config settings to executor
         self.executor.dry_run = dry_run
@@ -206,7 +329,14 @@ class ExperimentCLI:
         
         # Execute stages
         selected = stages if stages else list(self.executor._stages.keys())
-        self.executor.execute(selected)
+        
+        # Exclude specified stages
+        if exclude:
+            selected = [s for s in selected if s not in exclude]
+        
+        if reverse:
+            selected = list(reversed(selected))
+        self.executor.execute(selected, head=head, tail=tail, rerun=rerun)
     
     def cancel(self, stages: List[str]) -> None:
         """Cancel jobs for the specified stages."""
@@ -230,21 +360,42 @@ class ExperimentCLI:
             print("No jobs found to cancel.")
             return
         
+        # Load already canceled jobs
+        canceled_jobs = self.config_manager.load_canceled_jobs(self.executor.project)
+        
         # Group by job_id (since array jobs share one ID)
         job_ids = set()
         for job in all_jobs_to_cancel:
             if 'job_id' in job:
                 job_ids.add(job['job_id'])
         
+        # Filter out already canceled jobs
+        jobs_to_cancel = job_ids - canceled_jobs
+        
+        if not jobs_to_cancel:
+            print("No new jobs to cancel.")
+            return
+        
         # Cancel each job
-        for job_id in sorted(job_ids):
+        successfully_canceled = []
+        failed_to_cancel = []
+        
+        for job_id in sorted(jobs_to_cancel):
             try:
                 subprocess.run(['scancel', job_id], check=True, capture_output=True)
                 print(f"Cancelled job {job_id}")
+                successfully_canceled.append(job_id)
+                # Mark as canceled
+                self.config_manager.save_canceled_job(self.executor.project, job_id)
             except subprocess.CalledProcessError as e:
-                print(f"Failed to cancel job {job_id}: {e.stderr.decode()}")
+                error_msg = e.stderr.decode().strip()
+                print(f"Failed to cancel job {job_id}: {error_msg}")
+                failed_to_cancel.append(job_id)
         
-        print(f"\nCancelled {len(job_ids)} job(s)")
+        print()
+        print(f"Successfully cancelled {len(successfully_canceled)} job(s)")
+        if failed_to_cancel:
+            print(f"Failed to cancel {len(failed_to_cancel)} job(s)")
     
     def cat(self, job_spec: str, array_index: Optional[int] = None) -> None:
         """Print log file for a job.
@@ -369,6 +520,32 @@ class ExperimentCLI:
         print()
         print(f"Use 'cat <job_id>' or 'cat <job_id>_<array_index>' to view logs")
         print("=" * 100)
+    
+    def print_commands(self, stages: List[str], head: Optional[int] = None, tail: Optional[int] = None, rerun: bool = False, reverse: bool = False, exclude: Optional[List[str]] = None) -> None:
+        """Print commands to run sequentially (can be piped to bash)."""
+        from .executor import PrintExecutor
+        
+        # Create a PrintExecutor with the same paths as the SlurmExecutor
+        print_executor = PrintExecutor(
+            artifact_path=str(self.executor.artifact_path),
+            code_path=str(self.executor.code_path),
+            gs_path=self.executor.gs_path,
+            setup_command=self.executor.setup_command,
+        )
+        
+        # Copy stage information from the SlurmExecutor
+        print_executor._stages = self.executor._stages
+        
+        # Execute stages using PrintExecutor (will print commands to stdout)
+        selected = stages if stages else list(self.executor._stages.keys())
+        
+        # Exclude specified stages
+        if exclude:
+            selected = [s for s in selected if s not in exclude]
+        
+        if reverse:
+            selected = list(reversed(selected))
+        print_executor.execute(selected, head=head, tail=tail, rerun=rerun)
 
 
 def auto_cli(executor: SlurmExecutor) -> None:

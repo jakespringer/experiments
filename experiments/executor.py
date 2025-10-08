@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 from shlex import quote as shquote
 import subprocess
+import sys
 import tempfile
 
 import yaml
@@ -78,13 +79,25 @@ class Task:
         """Add a command execution block to this task."""
         self.blocks.append(CommandTaskBlock(command, vargs, kwargs, vformat, kwformat))
 
-    def upload_to_gs(self, path: str, gs_path: str) -> None:
+    def upload_to_gs(self, path: str, gs_path: str, directory: bool = False) -> None:
         """Add a Google Cloud Storage upload block to this task."""
-        self.blocks.append(UploadToGSTaskBlock(path, gs_path))
+        self.blocks.append(UploadToGSTaskBlock(path, gs_path, directory=directory))
 
-    def download_from_gs(self, gs_path: str, path: str) -> None:
+    def download_from_gs(self, gs_path: str, path: str, directory: bool = False, skip_existing: bool = True) -> None:
         """Add a Google Cloud Storage download block to this task."""
-        self.blocks.append(DownloadFromGSTaskBlock(gs_path, path))
+        self.blocks.append(DownloadFromGSTaskBlock(gs_path, path, directory=directory, skip_existing=skip_existing))
+
+    def download(self, url: str, local_path: str, skip_existing: bool = True) -> None:
+        """Add a web URL download block to this task."""
+        self.blocks.append(DownloadTaskBlock(url, local_path, skip_existing=skip_existing))
+
+    def ensure_directory(self, path: str) -> None:
+        """Add a directory creation block to this task."""
+        self.blocks.append(EnsureDirectoryTaskBlock(path))
+
+    def download_hf_model(self, model_name: str, local_dir: str, skip_existing: bool = True) -> None:
+        """Add a Hugging Face model download block to this task."""
+        self.blocks.append(DownloadHFModelTaskBlock(model_name, local_dir, skip_existing=skip_existing))
 
 class TaskBlock(ABC):
     """A block that yields a shell command line when executed."""
@@ -185,17 +198,20 @@ class UploadToGSTaskBlock(TaskBlock):
         self.directory = directory
     
     def execute(self) -> str:
-        """Generate a locked gcloud storage upload command."""
+        """Generate a locked gsutil upload command."""
         # Create a lockfile based on the local path to prevent concurrent access
         path_hash = hashlib.sha256(self.path.encode("utf-8")).hexdigest()[:10]
         lockfile = f"/tmp/{path_hash}.lock"
 
-        # Build the gcloud command
-        recursive_flag = "-r " if self.directory else ""
-        gcloud_cmd = f"gcloud storage cp {recursive_flag}{shquote(self.path)} {shquote(self.gs_path)}"
+        # Build the gsutil command
+        if self.directory:
+            # Use -m for parallel operations and -r for recursive
+            gsutil_cmd = f"gsutil -m cp -r {shquote(self.path)} {shquote(self.gs_path)}"
+        else:
+            gsutil_cmd = f"gsutil cp {shquote(self.path)} {shquote(self.gs_path)}"
 
         # Wrap in an exclusive file lock to prevent race conditions
-        return f"flock -x {shquote(lockfile)} -c {shquote(gcloud_cmd)}"
+        return f"flock -x {shquote(lockfile)} -c {shquote(gsutil_cmd)}"
 
 
 class DownloadFromGSTaskBlock(TaskBlock):
@@ -206,43 +222,162 @@ class DownloadFromGSTaskBlock(TaskBlock):
         gs_path: str,
         path: str,
         directory: bool = False,
+        skip_existing: bool = True,
     ) -> None:
         self.gs_path = gs_path  # Should be gs://bucket/path format
         self.path = path  # Local destination path
         self.directory = directory
+        self.skip_existing = skip_existing
 
     def execute(self) -> str:
-        """Generate a locked gcloud storage download command."""
-        # Create a lockfile based on the local path to prevent concurrent access
-        path_hash = hashlib.sha256(self.path.encode("utf-8")).hexdigest()[:10]
-        lockfile = f"/tmp/{path_hash}.lock"
+        """Generate a locked gsutil download command."""
+        # If skip_existing is enabled, check if path already exists
+        if self.skip_existing:
+            # Create a lockfile based on the local path to prevent concurrent access
+            path_hash = hashlib.sha256(self.path.encode("utf-8")).hexdigest()[:10]
+            lockfile = f"/tmp/{path_hash}.lock"
 
+            parts = []
+            
+            # Create necessary directories before download
+            if self.directory:
+                parts.append(f"mkdir -p -- {shquote(self.path)}")
+                # Use -m for parallel operations and -r for recursive
+                gsutil_cmd = f"gsutil -m cp -r {shquote(self.gs_path)} {shquote(self.path)}"
+            else:
+                parent = os.path.dirname(self.path) or "."
+                parts.append(f"mkdir -p -- {shquote(parent)}")
+                gsutil_cmd = f"gsutil cp {shquote(self.gs_path)} {shquote(self.path)}"
+
+            # Build and lock the gsutil command
+            parts.append(f"flock -x {shquote(lockfile)} -c {shquote(gsutil_cmd)}")
+            
+            # Wrap in existence check - only download if path doesn't exist
+            download_cmd = " && ".join(parts)
+            return f"[ ! -e {shquote(self.path)} ] && {{ {download_cmd}; }} || echo 'Skipping download, {self.path} already exists'"
+        else:
+            # Original behavior: always download
+            path_hash = hashlib.sha256(self.path.encode("utf-8")).hexdigest()[:10]
+            lockfile = f"/tmp/{path_hash}.lock"
+
+            parts = []
+            
+            # Create necessary directories before download
+            if self.directory:
+                parts.append(f"mkdir -p -- {shquote(self.path)}")
+                # Use -m for parallel operations and -r for recursive
+                gsutil_cmd = f"gsutil -m cp -r {shquote(self.gs_path)} {shquote(self.path)}"
+            else:
+                parent = os.path.dirname(self.path) or "."
+                parts.append(f"mkdir -p -- {shquote(parent)}")
+                gsutil_cmd = f"gsutil cp {shquote(self.gs_path)} {shquote(self.path)}"
+
+            # Build and lock the gsutil command
+            parts.append(f"flock -x {shquote(lockfile)} -c {shquote(gsutil_cmd)}")
+            
+            return " && ".join(parts)
+
+
+class DownloadTaskBlock(TaskBlock):
+    """Downloads a file from a web URL using curl."""
+
+    def __init__(
+        self,
+        url: str,
+        local_path: str,
+        mkdirs: bool = True,
+        skip_existing: bool = True,
+    ) -> None:
+        self.url = url
+        self.local_path = local_path
+        self.mkdirs = mkdirs
+        self.skip_existing = skip_existing
+
+    def execute(self) -> str:
+        """Generate shell command to download the file."""
         parts = []
         
-        # Create necessary directories before download
-        if self.directory:
-            parts.append(f"mkdir -p -- {shquote(self.path)}")
-            recursive_flag = "-r "
-        else:
-            parent = os.path.dirname(self.path) or "."
+        # Create parent directory if needed
+        if self.mkdirs:
+            parent = os.path.dirname(self.local_path) or "."
             parts.append(f"mkdir -p -- {shquote(parent)}")
-            recursive_flag = ""
-
-        # Build and lock the gcloud command
-        gcloud_cmd = f"gcloud storage cp {recursive_flag}{shquote(self.gs_path)} {shquote(self.path)}"
-        parts.append(f"flock -x {shquote(lockfile)} -c {shquote(gcloud_cmd)}")
         
-        return " && ".join(parts)
+        # Build the curl command
+        # -L: follow redirects
+        # -o: output file
+        curl_cmd = f"curl -L {shquote(self.url)} -o {shquote(self.local_path)}"
+        parts.append(curl_cmd)
+        
+        download_cmd = " && ".join(parts)
+        
+        # If skip_existing is enabled, check if file already exists
+        if self.skip_existing:
+            # Skip download if file exists
+            return f"[ ! -e {shquote(self.local_path)} ] && {{ {download_cmd}; }} || echo 'Skipping download, {self.local_path} already exists'"
+        else:
+            return download_cmd
+
+
+class EnsureDirectoryTaskBlock(TaskBlock):
+    """Creates a directory with mkdir -p."""
+
+    def __init__(self, path: str | Path) -> None:
+        self.path = str(path)
+
+    def execute(self) -> str:
+        """Generate shell command to create the directory."""
+        return f"mkdir -p -- {shquote(self.path)}"
+
+
+class DownloadHFModelTaskBlock(TaskBlock):
+    """Downloads a Hugging Face model to a local directory."""
+
+    def __init__(
+        self,
+        model_name: str,
+        local_dir: str,
+        mkdirs: bool = True,
+        skip_existing: bool = True,
+    ) -> None:
+        self.model_name = model_name
+        self.local_dir = local_dir
+        self.mkdirs = mkdirs
+        self.skip_existing = skip_existing
+
+    def execute(self) -> str:
+        """Generate shell command to download the HF model."""
+        parts = []
+        
+        # Create directory if needed
+        if self.mkdirs:
+            parts.append(f"mkdir -p -- {shquote(self.local_dir)}")
+        
+        # Build the hf download command
+        hf_cmd = f"hf download {shquote(self.model_name)} --local-dir {shquote(self.local_dir)}"
+        parts.append(hf_cmd)
+        
+        download_cmd = " && ".join(parts)
+        
+        # If skip_existing is enabled, check if directory already exists and is non-empty
+        if self.skip_existing:
+            # Skip download if directory exists and is not empty
+            return f"[ ! -e {shquote(self.local_dir)} ] && {{ {download_cmd}; }} || echo 'Skipping download, {self.local_dir} already exists'"
+        else:
+            return download_cmd
 
 
 def _find_artifact_dependencies(value: Any) -> Iterable[Artifact]:
     """Recursively find all Artifact instances within a data structure.
     
-    This traverses dictionaries, lists, tuples, and sets to discover artifact
-    dependencies declared in artifact attributes.
+    This traverses dictionaries, lists, tuples, sets, and ArtifactSets to discover
+    artifact dependencies declared in artifact attributes.
     """
     if isinstance(value, Artifact):
         yield value
+    elif isinstance(value, ArtifactSet):
+        # ArtifactSet may contain multiple artifacts that are dependencies
+        for item in value:
+            yield from _find_artifact_dependencies(item)
     elif isinstance(value, dict):
         for v in value.values():
             yield from _find_artifact_dependencies(v)
@@ -256,6 +391,7 @@ class Executor:
 
     def __init__(self) -> None:
         self._stages: Dict[str, List[Artifact]] = {}
+        self._verbose_filtering: bool = True  # Whether to print filter messages
 
     def stage(self, name: str, artifacts: Iterable[Artifact] | ArtifactSet) -> None:
         """Register a named stage containing artifacts to execute."""
@@ -273,18 +409,38 @@ class Executor:
         selected = list(args.stages) if args.stages else list(self._stages.keys())
         self.execute(selected)
 
-    def execute(self, stages: List[str]) -> None:
-        """Execute the specified stages (or all stages if empty list)."""
+    def execute(self, stages: List[str], head: int | None = None, tail: int | None = None, rerun: bool = False) -> None:
+        """Execute the specified stages (or all stages if empty list).
+        
+        Args:
+            stages: List of stage names to execute
+            head: If provided, only execute the first N artifacts
+            tail: If provided, only execute the last N artifacts
+            rerun: If True, ignore exists check and run all artifacts
+        """
         # Validate inputs
         if not self._stages:
-            print("No stages registered.")
+            print("No stages registered.", file=sys.stderr)
+            return
+
+        # Validate head/tail arguments
+        if head is not None and tail is not None:
+            print("Error: Cannot specify both --head and --tail", file=sys.stderr)
+            return
+        
+        if head is not None and head <= 0:
+            print(f"Error: --head must be positive, got {head}", file=sys.stderr)
+            return
+        
+        if tail is not None and tail <= 0:
+            print(f"Error: --tail must be positive, got {tail}", file=sys.stderr)
             return
 
         stages = self._validate_and_normalize_stages(stages)
         unique_artifacts = self._collect_unique_artifacts()
         
         if not unique_artifacts:
-            print("No artifacts registered.")
+            print("No artifacts registered.", file=sys.stderr)
             return
 
         # Compute execution order via topological sort
@@ -294,14 +450,39 @@ class Executor:
         filtered_tiers = self._filter_tiers_by_stages(all_tiers, stages)
         
         if not filtered_tiers:
-            print("No artifacts matched the selected stages.")
+            print("No artifacts matched the selected stages.", file=sys.stderr)
             return
 
+        # Filter out artifacts that should be skipped (e.g., already exist)
+        # unless rerun flag is set
+        executable_tiers, skipped_artifacts = self._filter_skipped_artifacts(filtered_tiers, rerun=rerun)
+        
+        # Report skipped artifacts
+        if skipped_artifacts:
+            print(f"Skipping {len(skipped_artifacts)} artifact(s) that already exist:", file=sys.stderr)
+            for artifact in skipped_artifacts:
+                print(f"  - {artifact.__class__.__name__} ({artifact.relpath})", file=sys.stderr)
+            print(file=sys.stderr)
+        
+        if not executable_tiers:
+            print("All artifacts already exist. Nothing to execute.", file=sys.stderr)
+            return
+
+        # Apply head/tail filtering if requested
+        if head is not None or tail is not None:
+            executable_tiers = self._apply_head_tail_filter(executable_tiers, head, tail)
+            
+            if not executable_tiers:
+                limit_type = "head" if head is not None else "tail"
+                limit_value = head if head is not None else tail
+                print(f"No artifacts remain after applying --{limit_type} {limit_value}", file=sys.stderr)
+                return
+
         # Build mapping of tier index to stage names
-        tier_to_stages = self._build_tier_to_stages_mapping(filtered_tiers, stages)
+        tier_to_stages = self._build_tier_to_stages_mapping(executable_tiers, stages)
         
         # Compile and launch
-        task_tiers = [[self.compile_artifact(a) for a in tier] for tier in filtered_tiers]
+        task_tiers = [[self.compile_artifact(a) for a in tier] for tier in executable_tiers]
         self.launch(task_tiers, tier_to_stages=tier_to_stages)
 
     def _validate_and_normalize_stages(self, stages: List[str]) -> List[str]:
@@ -350,6 +531,92 @@ class Executor:
                 a for a in tier
                 if artifact_to_stages.get(id(a), set()) & selected_set
             ]
+            if filtered_tier:
+                filtered_tiers.append(filtered_tier)
+        
+        return filtered_tiers
+    
+    def _filter_skipped_artifacts(
+        self,
+        tiers: List[List[Artifact]],
+        rerun: bool = False,
+    ) -> tuple[List[List[Artifact]], List[Artifact]]:
+        """Filter out artifacts that should be skipped.
+        
+        Args:
+            tiers: List of artifact tiers
+            rerun: If True, don't skip any artifacts (ignore exists check)
+            
+        Returns:
+            Tuple of (executable_tiers, skipped_artifacts) where:
+            - executable_tiers: Tiers with skipped artifacts removed
+            - skipped_artifacts: List of artifacts that were skipped
+        """
+        skipped_artifacts: List[Artifact] = []
+        executable_tiers: List[List[Artifact]] = []
+        
+        # If rerun is True, don't skip anything
+        if rerun:
+            return tiers, skipped_artifacts
+        
+        for tier in tiers:
+            executable_tier = []
+            for artifact in tier:
+                if artifact.should_skip():
+                    skipped_artifacts.append(artifact)
+                else:
+                    executable_tier.append(artifact)
+            
+            # Only include non-empty tiers
+            if executable_tier:
+                executable_tiers.append(executable_tier)
+        
+        return executable_tiers, skipped_artifacts
+    
+    def _apply_head_tail_filter(
+        self,
+        tiers: List[List[Artifact]],
+        head: int | None,
+        tail: int | None,
+    ) -> List[List[Artifact]]:
+        """Apply head or tail filtering to artifact tiers.
+        
+        Args:
+            tiers: List of artifact tiers
+            head: If provided, keep only the first N artifacts
+            tail: If provided, keep only the last N artifacts
+            
+        Returns:
+            Filtered list of artifact tiers
+        """
+        # Flatten tiers to get ordered list of artifacts
+        all_artifacts = [artifact for tier in tiers for artifact in tier]
+        
+        # Apply head/tail filter
+        if head is not None:
+            selected_artifacts = all_artifacts[:head]
+            if self._verbose_filtering:
+                print(f"Limiting to first {head} artifact(s) (out of {len(all_artifacts)} total)", file=sys.stderr)
+        elif tail is not None:
+            selected_artifacts = all_artifacts[-tail:]
+            if self._verbose_filtering:
+                print(f"Limiting to last {tail} artifact(s) (out of {len(all_artifacts)} total)", file=sys.stderr)
+        else:
+            return tiers
+        
+        if not selected_artifacts:
+            return []
+        
+        if self._verbose_filtering:
+            print(file=sys.stderr)
+        
+        # Create a set of selected artifact IDs for fast lookup
+        selected_ids = {id(a) for a in selected_artifacts}
+        
+        # Filter tiers to only include selected artifacts
+        filtered_tiers: List[List[Artifact]] = []
+        for tier in tiers:
+            filtered_tier = [a for a in tier if id(a) in selected_ids]
             if filtered_tier:
                 filtered_tiers.append(filtered_tier)
         
@@ -510,11 +777,14 @@ class PrintExecutor(Executor):
         artifact_path: str,
         code_path: str,
         gs_path: str | None = None,
+        setup_command: str | None = None,
     ) -> None:
         super().__init__()
         self.artifact_path = Path(artifact_path)
         self.code_path = Path(code_path)
         self.gs_path = gs_path
+        self.setup_command = setup_command
+        self._verbose_filtering = False  # Don't print filter messages for print command
 
     def compile_artifact(self, artifact: Artifact) -> Task:
         """Compile an artifact into a task by calling its construct method."""
@@ -529,6 +799,16 @@ class PrintExecutor(Executor):
 
     def launch(self, tiers: List[List[Task]], tier_to_stages: Dict[int, List[str]] | None = None) -> None:
         """Print all shell commands that would be executed."""
+        # Print bash safety header for proper error handling
+        print("#!/usr/bin/env bash")
+        print("set -euo pipefail")
+        print()
+        
+        # Run setup commands if provided
+        if self.setup_command:
+            print(self.setup_command)
+            print()
+        
         for tier in tiers:
             for task in tier:
                 for block in task.blocks:
@@ -553,6 +833,7 @@ class SlurmExecutor(Executor):
         gs_path: str | None = None,
         default_slurm_args: Dict[str, Any] | None = None,
         dry_run: bool = False,
+        setup_command: str | None = None,
     ) -> None:
         super().__init__()
         self.artifact_path = Path(artifact_path)
@@ -562,6 +843,7 @@ class SlurmExecutor(Executor):
         self.default_slurm_args = default_slurm_args or {}
         self.default_slurm_args_by_partition: Dict[str, Dict[str, Any]] = {}
         self.dry_run = dry_run
+        self.setup_command = setup_command
         self._next_fake_job_id = 1000  # For dry run mode
         self._dry_run_jobs: List[Dict[str, Any]] = []  # Store job info for dry run summary
         self.config_manager: Any = None  # Will be set by CLI
@@ -594,13 +876,13 @@ class SlurmExecutor(Executor):
         all_job_ids: List[str] = []
         
         if self.dry_run:
-            print("\n" + "=" * 100)
-            print("DRY RUN MODE - No jobs will be submitted")
-            print("=" * 100 + "\n")
+            print("\n" + "=" * 100, file=sys.stderr)
+            print("DRY RUN MODE - No jobs will be submitted", file=sys.stderr)
+            print("=" * 100 + "\n", file=sys.stderr)
         else:
-            print("\n" + "=" * 80)
-            print("Launching Jobs")
-            print("=" * 80 + "\n")
+            print("\n" + "=" * 80, file=sys.stderr)
+            print("Launching Jobs", file=sys.stderr)
+            print("=" * 80 + "\n", file=sys.stderr)
         
         for tier_index, tier in enumerate(tiers):
             if not tier:
@@ -692,12 +974,19 @@ class SlurmExecutor(Executor):
                     log_file = line.split("=", 1)[1]
                     break
             
-            # Collect artifact class names
+            # Collect artifact class names and check existence
             artifact_classes = [
                 task.artifact.__class__.__name__ 
                 for task in tasks 
                 if task.artifact is not None
             ]
+            
+            # Count how many tasks are complete vs remaining
+            num_complete = sum(
+                1 for task in tasks 
+                if task.artifact is not None and task.artifact.exists
+            )
+            num_remaining = len(tasks) - num_complete
             
             # Build job info
             job_info = {
@@ -706,6 +995,8 @@ class SlurmExecutor(Executor):
                 'tier': tier_index,
                 'group': group_index,
                 'num_tasks': len(tasks),
+                'num_complete': num_complete,
+                'num_remaining': num_remaining,
                 'artifact_classes': artifact_classes,
                 'config': slurm_config,
                 'dependencies': list(dependency_job_ids),
@@ -732,13 +1023,13 @@ class SlurmExecutor(Executor):
                 artifact_types = sorted(set(artifact_classes))
                 artifact_summary = ', '.join(artifact_types) if artifact_types else 'N/A'
                 
-                print(f"✓ Submitted job {job_id}: {job_name}")
-                print(f"  Tasks: {len(tasks)}, Artifacts: {artifact_summary}")
+                print(f"✓ Submitted job {job_id}: {job_name}", file=sys.stderr)
+                print(f"  Tasks: {len(tasks)}, Artifacts: {artifact_summary}", file=sys.stderr)
                 print(f"  Config: partition={slurm_config.get('partition', 'N/A')}, "
                       f"cpus={slurm_config.get('cpus', 'N/A')}, "
                       f"gpus={slurm_config.get('gpus', 'N/A')}, "
-                      f"time={slurm_config.get('time', 'N/A')}")
-                print()
+                      f"time={slurm_config.get('time', 'N/A')}", file=sys.stderr)
+                print(file=sys.stderr)
         
         return submitted_job_ids
     
@@ -775,6 +1066,24 @@ class SlurmExecutor(Executor):
         # Fallback to first stage name
         return stage_names[0] if stage_names else None
 
+    # Valid requirement keys that can be returned from get_requirements()
+    VALID_REQUIREMENT_KEYS = {
+        # Log files
+        'output', 'error', 'separate_error',
+        # Basic specifications
+        'partition', 'time', 'account', 'qos', 'chdir',
+        # Node and task resources
+        'nodes', 'ntasks', 'cpus', 'cpus_per_task',
+        # Memory
+        'mem', 'mem_per_cpu',
+        # GPU resources
+        'gpus', 'gres', 'constraint',
+        # Job control
+        'requeue', 'signal', 'open_mode',
+        # Email notifications
+        'mail_type', 'mail_user',
+    }
+
     def _group_tasks_by_requirements(
         self,
         tier: List[Task],
@@ -790,6 +1099,15 @@ class SlurmExecutor(Executor):
             # Extract requirements from artifact
             if task.artifact is not None and hasattr(task.artifact, 'get_requirements'):
                 reqs = dict(task.artifact.get_requirements())  # type: ignore[attr-defined]
+                
+                # Validate that all keys are recognized
+                invalid_keys = set(reqs.keys()) - self.VALID_REQUIREMENT_KEYS
+                if invalid_keys:
+                    artifact_name = task.artifact.__class__.__name__
+                    raise ValueError(
+                        f"Invalid requirement key(s) in {artifact_name}.get_requirements(): {invalid_keys}. "
+                        f"Valid keys are: {sorted(self.VALID_REQUIREMENT_KEYS)}"
+                    )
             else:
                 reqs = {}
             
@@ -820,8 +1138,11 @@ class SlurmExecutor(Executor):
         config: Dict[str, Any] = {}
         config.update(self.default_slurm_args)
         
+        # Get default partition from config or use 'general' as fallback
+        default_partition = self.config.get('default_partition', 'general')
+        
         # Apply partition-specific defaults from config
-        partition = reqs.get('partition', config.get('partition', 'general'))
+        partition = reqs.get('partition', config.get('partition', default_partition))
         if partition in self.default_slurm_args_by_partition:
             config.update(self.default_slurm_args_by_partition[partition])
         
@@ -829,7 +1150,7 @@ class SlurmExecutor(Executor):
         config.update(reqs)
         
         # Apply reasonable defaults
-        config.setdefault('partition', 'general')
+        config.setdefault('partition', default_partition)
         config.setdefault('time', '2-00:00:00')  # 2 days default
         
         # Set default cpus to match number of GPUs
@@ -876,36 +1197,79 @@ class SlurmExecutor(Executor):
         log_dir = self.config.get('log_directory', str(Path.home() / ".experiments" / "logs"))
         Path(log_dir).mkdir(parents=True, exist_ok=True)
         
-        log_file = f"{log_dir}/{job_name}_%A_%a.log"
-        lines.append(f"#SBATCH --output={log_file}")
-        lines.append(f"#SBATCH --error={log_file}")
+        # Use custom output/error paths if provided, otherwise use defaults
+        if 'output' in config:
+            lines.append(f"#SBATCH --output={config['output']}")
+        else:
+            output_file = f"{log_dir}/{job_name}_%A_%a.out"
+            lines.append(f"#SBATCH --output={output_file}")
+        
+        if 'error' in config:
+            lines.append(f"#SBATCH --error={config['error']}")
+        elif config.get('separate_error', False):
+            # Only add separate error file if explicitly requested
+            error_file = f"{log_dir}/{job_name}_%A_%a.err"
+            lines.append(f"#SBATCH --error={error_file}")
+        
+        # Working directory
+        if 'chdir' in config:
+            lines.append(f"#SBATCH --chdir={config['chdir']}")
         
         # Dependencies: wait for all previous tier jobs to complete successfully
         if dependency_job_ids:
             dependency_str = ":".join(dependency_job_ids)
             lines.append(f"#SBATCH --dependency=afterok:{dependency_str}")
         
-        # Resource specifications
+        # Basic resource specifications
         if 'partition' in config:
             lines.append(f"#SBATCH --partition={config['partition']}")
         if 'time' in config:
             lines.append(f"#SBATCH --time={config['time']}")
-        if 'cpus' in config:
-            lines.append(f"#SBATCH --cpus-per-task={config['cpus']}")
-        
-        # QOS (Quality of Service)
+        if 'account' in config:
+            lines.append(f"#SBATCH --account={config['account']}")
         if 'qos' in config:
             lines.append(f"#SBATCH --qos={config['qos']}")
         
-        # Requeue flag
+        # Node and task specifications
+        if 'nodes' in config:
+            lines.append(f"#SBATCH --nodes={config['nodes']}")
+        if 'ntasks' in config:
+            lines.append(f"#SBATCH --ntasks={config['ntasks']}")
+        if 'cpus' in config or 'cpus_per_task' in config:
+            cpus = config.get('cpus') or config.get('cpus_per_task')
+            lines.append(f"#SBATCH --cpus-per-task={cpus}")
+        
+        # Memory specifications
+        if 'mem' in config:
+            lines.append(f"#SBATCH --mem={config['mem']}")
+        if 'mem_per_cpu' in config:
+            lines.append(f"#SBATCH --mem-per-cpu={config['mem_per_cpu']}")
+        
+        # GPU handling
+        # Support modern --gpus flag
+        if 'gpus' in config:
+            gpus_str = str(config['gpus'])
+            lines.append(f"#SBATCH --gpus={gpus_str}")
+        # Support --gres for older clusters
+        if 'gres' in config:
+            lines.append(f"#SBATCH --gres={config['gres']}")
+        # Support constraint for specific hardware
+        if 'constraint' in config:
+            lines.append(f"#SBATCH --constraint={config['constraint']}")
+        
+        # Job control flags
         if config.get('requeue', False):
             lines.append(f"#SBATCH --requeue")
+        if 'signal' in config:
+            lines.append(f"#SBATCH --signal={config['signal']}")
+        if 'open_mode' in config:
+            lines.append(f"#SBATCH --open-mode={config['open_mode']}")
         
-        # GPU handling: use --gpus format for all cases
-        gpus_val = config.get('gpus')
-        if gpus_val is not None:
-            gpus_str = str(gpus_val)
-            lines.append(f"#SBATCH --gpus={gpus_str}")
+        # Email notifications
+        if 'mail_type' in config:
+            lines.append(f"#SBATCH --mail-type={config['mail_type']}")
+        if 'mail_user' in config:
+            lines.append(f"#SBATCH --mail-user={config['mail_user']}")
         
         # Array specification
         max_index = len(tasks) - 1
@@ -917,8 +1281,15 @@ class SlurmExecutor(Executor):
         """Build the shell script body with case statement for array tasks."""
         lines = [
             "set -euo pipefail",
-            "case \"${SLURM_ARRAY_TASK_ID:-0}\" in",
         ]
+        
+        # Add setup commands if provided
+        if self.setup_command:
+            lines.append("")
+            lines.append(self.setup_command)
+            lines.append("")
+        
+        lines.append("case \"${SLURM_ARRAY_TASK_ID:-0}\" in")
         
         # Add a case for each task
         for idx, task in enumerate(tier):
@@ -926,6 +1297,9 @@ class SlurmExecutor(Executor):
             for block in task.blocks:
                 command = block.execute()
                 if command:
+                    # Print the command before executing it (escape single quotes for the echo)
+                    escaped_command = command.replace("'", "'\\''")
+                    lines.append(f"    echo '+ {escaped_command}' >&2")
                     lines.append(f"    {command}")
             lines.append("    ;;")
         
@@ -1011,20 +1385,23 @@ class SlurmExecutor(Executor):
     def _print_dry_run_summary(self) -> None:
         """Print a nice summary of jobs that would be submitted in dry run mode."""
         if not self._dry_run_jobs:
-            print("\nNo jobs to submit.\n")
+            print("\nNo jobs to submit.\n", file=sys.stderr)
             return
         
-        print("\n" + "=" * 100)
-        print("DRY RUN SUMMARY")
-        print("=" * 100 + "\n")
+        print("\n" + "=" * 100, file=sys.stderr)
+        print("DRY RUN SUMMARY", file=sys.stderr)
+        print("=" * 100 + "\n", file=sys.stderr)
         
         # Overall statistics
         total_jobs = len(self._dry_run_jobs)
         total_tasks = sum(job['num_tasks'] for job in self._dry_run_jobs)
+        total_complete = sum(job.get('num_complete', 0) for job in self._dry_run_jobs)
+        total_remaining = sum(job.get('num_remaining', 0) for job in self._dry_run_jobs)
         
-        print(f"Total jobs: {total_jobs}")
-        print(f"Total tasks: {total_tasks}")
-        print()
+        print(f"Total jobs: {total_jobs}", file=sys.stderr)
+        print(f"Total tasks: {total_tasks}", file=sys.stderr)
+        print(f"Complete: {total_complete}, Remaining: {total_remaining}", file=sys.stderr)
+        print(file=sys.stderr)
         
         # Count artifacts by class
         artifact_counts: Dict[str, int] = defaultdict(int)
@@ -1033,31 +1410,31 @@ class SlurmExecutor(Executor):
                 artifact_counts[artifact_class] += 1
         
         if artifact_counts:
-            print("Artifact types:")
+            print("Artifact types:", file=sys.stderr)
             for artifact_class, count in sorted(artifact_counts.items()):
-                print(f"  {artifact_class}: {count} task(s)")
-            print()
+                print(f"  {artifact_class}: {count} task(s)", file=sys.stderr)
+            print(file=sys.stderr)
         
         # List jobs by tier
         jobs_by_tier: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
         for job in self._dry_run_jobs:
             jobs_by_tier[job['tier']].append(job)
         
-        print("Job submission plan:")
-        print()
+        print("Job submission plan:", file=sys.stderr)
+        print(file=sys.stderr)
         
         for tier_index in sorted(jobs_by_tier.keys()):
             tier_jobs = jobs_by_tier[tier_index]
-            print(f"Tier {tier_index}:")
+            print(f"Tier {tier_index}:", file=sys.stderr)
             
             for job in tier_jobs:
-                print(f"  Job {job['job_id']}: {job['job_name']}")
-                print(f"    Tasks: {job['num_tasks']}")
+                print(f"  Job {job['job_id']}: {job['job_name']}", file=sys.stderr)
+                print(f"    Tasks: {job['num_tasks']}", file=sys.stderr)
                 
                 # Show unique artifact types in this job
                 unique_artifacts = sorted(set(job['artifact_classes']))
                 if unique_artifacts:
-                    print(f"    Artifacts: {', '.join(unique_artifacts)}")
+                    print(f"    Artifacts: {', '.join(unique_artifacts)}", file=sys.stderr)
                 
                 # Show key resource requirements
                 config = job['config']
@@ -1072,35 +1449,35 @@ class SlurmExecutor(Executor):
                     resources.append(f"time={config['time']}")
                 
                 if resources:
-                    print(f"    Resources: {', '.join(resources)}")
+                    print(f"    Resources: {', '.join(resources)}", file=sys.stderr)
                 
                 # Show dependencies
                 if job['dependencies']:
                     deps_str = ', '.join(job['dependencies'])
-                    print(f"    Dependencies: {deps_str}")
+                    print(f"    Dependencies: {deps_str}", file=sys.stderr)
                 else:
-                    print(f"    Dependencies: None (first tier)")
+                    print(f"    Dependencies: None (first tier)", file=sys.stderr)
                 
-                print(f"    Script: {job['script_path']}")
-                print()
+                print(f"    Script: {job['script_path']}", file=sys.stderr)
+                print(file=sys.stderr)
         
-        print("=" * 100)
-        print("To actually submit these jobs, run without the --dry flag")
-        print("=" * 100 + "\n")
+        print("=" * 100, file=sys.stderr)
+        print("To actually submit these jobs, run without the --dry flag", file=sys.stderr)
+        print("=" * 100 + "\n", file=sys.stderr)
     
     def _print_launch_summary(self, job_ids: List[str]) -> None:
         """Print a brief summary of jobs that were actually launched."""
         if not job_ids:
-            print("\nNo jobs were submitted.\n")
+            print("\nNo jobs were submitted.\n", file=sys.stderr)
             return
         
-        print("=" * 80)
-        print("Launch Summary")
-        print("=" * 80)
-        print()
-        print(f"Total jobs submitted: {len(job_ids)}")
-        print(f"Job IDs: {', '.join(job_ids)}")
-        print()
-        print("Use 'python <script> history' to view full details")
-        print("Use 'python <script> cat <job_id>' to view logs")
-        print("=" * 80 + "\n")
+        print("=" * 80, file=sys.stderr)
+        print("Launch Summary", file=sys.stderr)
+        print("=" * 80, file=sys.stderr)
+        print(file=sys.stderr)
+        print(f"Total jobs submitted: {len(job_ids)}", file=sys.stderr)
+        print(f"Job IDs: {', '.join(job_ids)}", file=sys.stderr)
+        print(file=sys.stderr)
+        print("Use 'python <script> history' to view full details", file=sys.stderr)
+        print("Use 'python <script> cat <job_id>' to view logs", file=sys.stderr)
+        print("=" * 80 + "\n", file=sys.stderr)

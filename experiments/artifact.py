@@ -21,6 +21,33 @@ class Artifact:
         class_name = self.__class__.__name__
         hash = self.get_hash()
         return f"{class_name}/{hash}"
+    
+    @property
+    def exists(self) -> bool:
+        """Check if this artifact already exists.
+        
+        Override this property in subclasses to implement custom existence checks.
+        When exists returns True, the artifact will be skipped during execution.
+        
+        Returns:
+            False by default (artifact needs to be executed)
+        """
+        return False
+    
+    def should_skip(self) -> bool:
+        """Determine if this artifact should be skipped during execution.
+        
+        This method provides a centralized place to check various skip conditions.
+        Currently checks if the artifact exists, but can be extended in the future
+        with additional skip conditions.
+        
+        Override this method in subclasses for custom skip logic, or simply
+        override the 'exists' property for existence-based skipping.
+        
+        Returns:
+            True if the artifact should be skipped, False otherwise
+        """
+        return self.exists
 
     def as_dict(self) -> Dict[str, Any]:
         # Shallow extraction to preserve Artifact references
