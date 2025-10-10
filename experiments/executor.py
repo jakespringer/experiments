@@ -99,6 +99,25 @@ class Task:
         """Add a Hugging Face model download block to this task."""
         self.blocks.append(DownloadHFModelTaskBlock(model_name, local_dir, skip_existing=skip_existing))
 
+    def rsync_to_gs(self, path: str, gs_path: str, delete: bool = False, checksum: bool = False, contents: bool | None = None, check_exists: bool = False) -> None:
+        """Add a Google Cloud Storage rsync upload block to this task."""
+        self.blocks.append(RsyncToGSTaskBlock(path, gs_path, delete=delete, checksum=checksum, contents=contents, check_exists=check_exists))
+
+    def rsync_from_gs(self, gs_path: str, path: str, delete: bool = False, checksum: bool = False, skip_existing: bool = True, contents: bool | None = None, check_exists: bool = False) -> None:
+        """Add a Google Cloud Storage rsync download block to this task."""
+        self.blocks.append(RsyncFromGSTaskBlock(gs_path, path, delete=delete, checksum=checksum, skip_existing=skip_existing, contents=contents, check_exists=check_exists))
+
+    def set_env(self, name: str, value: str, from_command: bool = False) -> None:
+        """Add an environment variable export block to this task.
+        
+        Args:
+            name: The environment variable name
+            value: The value to set (or command to run if from_command=True)
+            from_command: If True, treat value as a command and set the variable
+                         to the command's stdout
+        """
+        self.blocks.append(SetEnvTaskBlock(name, value, from_command=from_command))
+
 class TaskBlock(ABC):
     """A block that yields a shell command line when executed."""
 
@@ -364,6 +383,172 @@ class DownloadHFModelTaskBlock(TaskBlock):
             return f"[ ! -e {shquote(self.local_dir)} ] && {{ {download_cmd}; }} || echo 'Skipping download, {self.local_dir} already exists'"
         else:
             return download_cmd
+
+
+class RsyncToGSTaskBlock(TaskBlock):
+    """Syncs a local directory to Google Cloud Storage using gsutil rsync with locking."""
+
+    def __init__(
+        self,
+        path: str,
+        gs_path: str,
+        delete: bool = False,
+        checksum: bool = False,
+        contents: bool | None = None,
+        check_exists: bool = False,
+    ) -> None:
+        self.path = path
+        self.gs_path = gs_path  # Should be gs://bucket/path format
+        self.delete = delete  # If True, delete files in destination not in source
+        self.checksum = checksum  # If True, use checksum comparison instead of mtime
+        self.contents = contents  # If True, add trailing slashes; if False, remove them; if None, leave as-is
+        self.check_exists = check_exists  # If True, only rsync if remote path exists
+    
+    def execute(self) -> str:
+        """Generate a locked gsutil rsync command."""
+        # Create a lockfile based on the local path to prevent concurrent access
+        path_hash = hashlib.sha256(self.path.encode("utf-8")).hexdigest()[:10]
+        lockfile = f"/tmp/{path_hash}.lock"
+
+        # Handle trailing slashes based on contents parameter
+        source_path = self.path
+        dest_path = self.gs_path
+        if self.contents is True:
+            # Add trailing slashes to sync directory contents
+            if not source_path.endswith('/'):
+                source_path = source_path + '/'
+            if not dest_path.endswith('/'):
+                dest_path = dest_path + '/'
+        elif self.contents is False:
+            # Remove trailing slashes
+            source_path = source_path.rstrip('/')
+            dest_path = dest_path.rstrip('/')
+        # If contents is None, leave paths as-is
+
+        # Build the gsutil rsync command
+        # -r for recursive sync, -m for parallel operations
+        gsutil_cmd_parts = ["gsutil", "-m", "rsync", "-r"]
+        
+        # Add optional flags
+        if self.delete:
+            gsutil_cmd_parts.append("-d")  # Delete files in dest not in source
+        if self.checksum:
+            gsutil_cmd_parts.append("-c")  # Use checksum instead of mtime
+        
+        # Add source and destination
+        gsutil_cmd_parts.extend([shquote(source_path), shquote(dest_path)])
+        gsutil_cmd = " ".join(gsutil_cmd_parts)
+
+        # Wrap in an exclusive file lock to prevent race conditions
+        locked_cmd = f"flock -x {shquote(lockfile)} -c {shquote(gsutil_cmd)}"
+        
+        # If check_exists is enabled, only rsync if the remote path exists
+        if self.check_exists:
+            # Check if the remote GCS path exists
+            check_cmd = f"gsutil -q ls {shquote(dest_path)} > /dev/null 2>&1"
+            return f"{check_cmd} && {{ {locked_cmd}; }} || echo 'Skipping rsync, remote path {dest_path} does not exist'"
+        else:
+            return locked_cmd
+
+
+class RsyncFromGSTaskBlock(TaskBlock):
+    """Syncs from Google Cloud Storage to a local directory using gsutil rsync with locking."""
+
+    def __init__(
+        self,
+        gs_path: str,
+        path: str,
+        delete: bool = False,
+        checksum: bool = False,
+        skip_existing: bool = True,
+        contents: bool | None = None,
+        check_exists: bool = False,
+    ) -> None:
+        self.gs_path = gs_path  # Should be gs://bucket/path format
+        self.path = path  # Local destination path
+        self.delete = delete  # If True, delete files in destination not in source
+        self.checksum = checksum  # If True, use checksum comparison instead of mtime
+        self.skip_existing = skip_existing
+        self.contents = contents  # If True, add trailing slashes; if False, remove them; if None, leave as-is
+        self.check_exists = check_exists  # If True, only rsync if remote path exists
+
+    def execute(self) -> str:
+        """Generate a locked gsutil rsync command."""
+        # Create a lockfile based on the local path to prevent concurrent access
+        path_hash = hashlib.sha256(self.path.encode("utf-8")).hexdigest()[:10]
+        lockfile = f"/tmp/{path_hash}.lock"
+
+        # Handle trailing slashes based on contents parameter
+        source_path = self.gs_path
+        dest_path = self.path
+        if self.contents is True:
+            # Add trailing slashes to sync directory contents
+            if not source_path.endswith('/'):
+                source_path = source_path + '/'
+            if not dest_path.endswith('/'):
+                dest_path = dest_path + '/'
+        elif self.contents is False:
+            # Remove trailing slashes
+            source_path = source_path.rstrip('/')
+            dest_path = dest_path.rstrip('/')
+        # If contents is None, leave paths as-is
+
+        parts = []
+        
+        # Create necessary directory before sync
+        # Use the original path (without trailing slash) for mkdir
+        parts.append(f"mkdir -p -- {shquote(self.path.rstrip('/'))}")
+
+        # Build the gsutil rsync command
+        # -r for recursive sync, -m for parallel operations
+        gsutil_cmd_parts = ["gsutil", "-m", "rsync", "-r"]
+        
+        # Add optional flags
+        if self.delete:
+            gsutil_cmd_parts.append("-d")  # Delete files in dest not in source
+        if self.checksum:
+            gsutil_cmd_parts.append("-c")  # Use checksum instead of mtime
+        
+        # Add source and destination (with potential trailing slashes)
+        gsutil_cmd_parts.extend([shquote(source_path), shquote(dest_path)])
+        gsutil_cmd = " ".join(gsutil_cmd_parts)
+
+        # Build and lock the gsutil command
+        parts.append(f"flock -x {shquote(lockfile)} -c {shquote(gsutil_cmd)}")
+        
+        sync_cmd = " && ".join(parts)
+        
+        # If check_exists is enabled, wrap with remote existence check
+        if self.check_exists:
+            # Check if the remote GCS path exists
+            check_cmd = f"gsutil -q ls {shquote(source_path)} > /dev/null 2>&1"
+            sync_cmd = f"{check_cmd} && {{ {sync_cmd}; }} || echo 'Skipping rsync, remote path {source_path} does not exist'"
+        
+        # If skip_existing is enabled, check if local path already exists
+        if self.skip_existing:
+            # Skip sync if directory exists (check original path without trailing slash)
+            return f"[ ! -e {shquote(self.path.rstrip('/'))} ] && {{ {sync_cmd}; }} || echo 'Skipping sync, {self.path} already exists'"
+        else:
+            return sync_cmd
+
+
+class SetEnvTaskBlock(TaskBlock):
+    """Sets an environment variable by exporting it."""
+
+    def __init__(self, name: str, value: str, from_command: bool = False) -> None:
+        self.name = name
+        self.value = value
+        self.from_command = from_command
+
+    def execute(self) -> str:
+        """Generate shell command to export an environment variable."""
+        if self.from_command:
+            # Set variable to the stdout of the command (strip trailing whitespace)
+            # Use $(...) for command substitution
+            return f"export {self.name}=$({self.value})"
+        else:
+            # Use shquote to safely quote the value
+            return f"export {self.name}={shquote(self.value)}"
 
 
 def _find_artifact_dependencies(value: Any) -> Iterable[Artifact]:
