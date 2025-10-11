@@ -250,51 +250,40 @@ class DownloadFromGSTaskBlock(TaskBlock):
 
     def execute(self) -> str:
         """Generate a locked gsutil download command."""
+        # Create a lockfile based on the local path to prevent concurrent access
+        path_hash = hashlib.sha256(self.path.encode("utf-8")).hexdigest()[:10]
+        lockfile = f"/tmp/{path_hash}.lock"
+
+        # Build the inner command (existence check + download)
+        inner_parts = []
+        
         # If skip_existing is enabled, check if path already exists
         if self.skip_existing:
-            # Create a lockfile based on the local path to prevent concurrent access
-            path_hash = hashlib.sha256(self.path.encode("utf-8")).hexdigest()[:10]
-            lockfile = f"/tmp/{path_hash}.lock"
-
-            parts = []
-            
-            # Create necessary directories before download
-            if self.directory:
-                parts.append(f"mkdir -p -- {shquote(self.path)}")
-                # Use -m for parallel operations and -r for recursive
-                gsutil_cmd = f"gsutil -m cp -r {shquote(self.gs_path)} {shquote(self.path)}"
-            else:
-                parent = os.path.dirname(self.path) or "."
-                parts.append(f"mkdir -p -- {shquote(parent)}")
-                gsutil_cmd = f"gsutil cp {shquote(self.gs_path)} {shquote(self.path)}"
-
-            # Build and lock the gsutil command
-            parts.append(f"flock -x {shquote(lockfile)} -c {shquote(gsutil_cmd)}")
-            
-            # Wrap in existence check - only download if path doesn't exist
-            download_cmd = " && ".join(parts)
-            return f"[ ! -e {shquote(self.path)} ] && {{ {download_cmd}; }} || echo 'Skipping download, {self.path} already exists'"
+            inner_parts.append(f"[ ! -e {shquote(self.path)} ]")
+        
+        # Create necessary directories before download
+        if self.directory:
+            inner_parts.append(f"mkdir -p -- {shquote(self.path)}")
+            # Use -m for parallel operations and -r for recursive
+            gsutil_cmd = f"gsutil -m cp -r {shquote(self.gs_path)} {shquote(self.path)}"
         else:
-            # Original behavior: always download
-            path_hash = hashlib.sha256(self.path.encode("utf-8")).hexdigest()[:10]
-            lockfile = f"/tmp/{path_hash}.lock"
-
-            parts = []
-            
-            # Create necessary directories before download
-            if self.directory:
-                parts.append(f"mkdir -p -- {shquote(self.path)}")
-                # Use -m for parallel operations and -r for recursive
-                gsutil_cmd = f"gsutil -m cp -r {shquote(self.gs_path)} {shquote(self.path)}"
-            else:
-                parent = os.path.dirname(self.path) or "."
-                parts.append(f"mkdir -p -- {shquote(parent)}")
-                gsutil_cmd = f"gsutil cp {shquote(self.gs_path)} {shquote(self.path)}"
-
-            # Build and lock the gsutil command
-            parts.append(f"flock -x {shquote(lockfile)} -c {shquote(gsutil_cmd)}")
-            
-            return " && ".join(parts)
+            parent = os.path.dirname(self.path) or "."
+            inner_parts.append(f"mkdir -p -- {shquote(parent)}")
+            gsutil_cmd = f"gsutil cp {shquote(self.gs_path)} {shquote(self.path)}"
+        
+        inner_parts.append(gsutil_cmd)
+        
+        # Combine inner parts
+        inner_cmd = " && ".join(inner_parts)
+        
+        # Wrap entire command (including existence check) in flock
+        if self.skip_existing:
+            # Add skip message for when file exists
+            locked_cmd = f"flock -x {shquote(lockfile)} -c {shquote(inner_cmd)} || echo 'Skipping download, {self.path} already exists'"
+        else:
+            locked_cmd = f"flock -x {shquote(lockfile)} -c {shquote(inner_cmd)}"
+        
+        return locked_cmd
 
 
 class DownloadTaskBlock(TaskBlock):
@@ -425,6 +414,13 @@ class RsyncToGSTaskBlock(TaskBlock):
             dest_path = dest_path.rstrip('/')
         # If contents is None, leave paths as-is
 
+        # Build the inner command (existence check + rsync)
+        inner_parts = []
+        
+        # If check_exists is enabled, check if the remote path exists
+        if self.check_exists:
+            inner_parts.append(f"gsutil -q ls {shquote(dest_path)} > /dev/null 2>&1")
+        
         # Build the gsutil rsync command
         # -r for recursive sync, -m for parallel operations
         gsutil_cmd_parts = ["gsutil", "-m", "rsync", "-r"]
@@ -438,17 +434,20 @@ class RsyncToGSTaskBlock(TaskBlock):
         # Add source and destination
         gsutil_cmd_parts.extend([shquote(source_path), shquote(dest_path)])
         gsutil_cmd = " ".join(gsutil_cmd_parts)
-
-        # Wrap in an exclusive file lock to prevent race conditions
-        locked_cmd = f"flock -x {shquote(lockfile)} -c {shquote(gsutil_cmd)}"
         
-        # If check_exists is enabled, only rsync if the remote path exists
+        inner_parts.append(gsutil_cmd)
+        
+        # Combine inner parts
+        inner_cmd = " && ".join(inner_parts)
+        
+        # Wrap entire command (including existence check) in flock
         if self.check_exists:
-            # Check if the remote GCS path exists
-            check_cmd = f"gsutil -q ls {shquote(dest_path)} > /dev/null 2>&1"
-            return f"{check_cmd} && {{ {locked_cmd}; }} || echo 'Skipping rsync, remote path {dest_path} does not exist'"
+            # Add skip message for when remote path doesn't exist
+            locked_cmd = f"flock -x {shquote(lockfile)} -c {shquote(inner_cmd)} || echo 'Skipping rsync, remote path {dest_path} does not exist'"
         else:
-            return locked_cmd
+            locked_cmd = f"flock -x {shquote(lockfile)} -c {shquote(inner_cmd)}"
+        
+        return locked_cmd
 
 
 class RsyncFromGSTaskBlock(TaskBlock):
@@ -493,11 +492,20 @@ class RsyncFromGSTaskBlock(TaskBlock):
             dest_path = dest_path.rstrip('/')
         # If contents is None, leave paths as-is
 
-        parts = []
+        # Build the inner command (all checks + mkdir + rsync)
+        inner_parts = []
+        
+        # If skip_existing is enabled, check if local path already exists
+        if self.skip_existing:
+            inner_parts.append(f"[ ! -e {shquote(self.path.rstrip('/'))} ]")
+        
+        # If check_exists is enabled, check if the remote path exists
+        if self.check_exists:
+            inner_parts.append(f"gsutil -q ls {shquote(source_path)} > /dev/null 2>&1")
         
         # Create necessary directory before sync
         # Use the original path (without trailing slash) for mkdir
-        parts.append(f"mkdir -p -- {shquote(self.path.rstrip('/'))}")
+        inner_parts.append(f"mkdir -p -- {shquote(self.path.rstrip('/'))}")
 
         # Build the gsutil rsync command
         # -r for recursive sync, -m for parallel operations
@@ -512,24 +520,24 @@ class RsyncFromGSTaskBlock(TaskBlock):
         # Add source and destination (with potential trailing slashes)
         gsutil_cmd_parts.extend([shquote(source_path), shquote(dest_path)])
         gsutil_cmd = " ".join(gsutil_cmd_parts)
-
-        # Build and lock the gsutil command
-        parts.append(f"flock -x {shquote(lockfile)} -c {shquote(gsutil_cmd)}")
         
-        sync_cmd = " && ".join(parts)
+        inner_parts.append(gsutil_cmd)
         
-        # If check_exists is enabled, wrap with remote existence check
-        if self.check_exists:
-            # Check if the remote GCS path exists
-            check_cmd = f"gsutil -q ls {shquote(source_path)} > /dev/null 2>&1"
-            sync_cmd = f"{check_cmd} && {{ {sync_cmd}; }} || echo 'Skipping rsync, remote path {source_path} does not exist'"
+        # Combine inner parts
+        inner_cmd = " && ".join(inner_parts)
         
-        # If skip_existing is enabled, check if local path already exists
-        if self.skip_existing:
-            # Skip sync if directory exists (check original path without trailing slash)
-            return f"[ ! -e {shquote(self.path.rstrip('/'))} ] && {{ {sync_cmd}; }} || echo 'Skipping sync, {self.path} already exists'"
+        # Wrap entire command (including all checks) in flock
+        locked_cmd = f"flock -x {shquote(lockfile)} -c {shquote(inner_cmd)}"
+        
+        # Add appropriate skip message based on what checks are enabled
+        if self.skip_existing and self.check_exists:
+            return f"{locked_cmd} || echo 'Skipping sync (path exists or remote unavailable)'"
+        elif self.skip_existing:
+            return f"{locked_cmd} || echo 'Skipping sync, {self.path} already exists'"
+        elif self.check_exists:
+            return f"{locked_cmd} || echo 'Skipping rsync, remote path {source_path} does not exist'"
         else:
-            return sync_cmd
+            return locked_cmd
 
 
 class SetEnvTaskBlock(TaskBlock):
