@@ -7,7 +7,6 @@ import base64
 import hashlib
 import os
 from pathlib import Path
-import random
 from shlex import quote as shquote
 import subprocess
 import sys
@@ -230,11 +229,8 @@ class UploadToGSTaskBlock(TaskBlock):
         else:
             gsutil_cmd = f"gsutil cp {shquote(self.path)} {shquote(self.gs_path)}"
 
-        # Add random sleep before flock to avoid contention
-        sleep_duration = random.random()  # Random float between 0.0 and 1.0
-        
         # Wrap in an exclusive file lock to prevent race conditions
-        return f"sleep {sleep_duration} && flock -x {shquote(lockfile)} -c {shquote(gsutil_cmd)}"
+        return f"flock -x {shquote(lockfile)} -c {shquote(gsutil_cmd)}"
 
 
 class DownloadFromGSTaskBlock(TaskBlock):
@@ -258,13 +254,12 @@ class DownloadFromGSTaskBlock(TaskBlock):
         path_hash = hashlib.sha256(self.path.encode("utf-8")).hexdigest()[:10]
         lockfile = f"/tmp/{path_hash}.lock"
 
-        # Build the inner command (existence check + download + verification)
+        # Build the inner command (existence check + download)
         inner_parts = []
         
         # If skip_existing is enabled, check if path already exists
         if self.skip_existing:
             inner_parts.append(f"[ ! -e {shquote(self.path)} ]")
-            inner_parts.append(f"echo '{self.path} does not exist, downloading' >&2")
         
         # Create necessary directories before download
         if self.directory:
@@ -278,28 +273,15 @@ class DownloadFromGSTaskBlock(TaskBlock):
         
         inner_parts.append(gsutil_cmd)
         
-        # Add verification loop to ensure file appears on filesystem
-        verify_cmd = (
-            f"for i in $(seq 1 300); do "
-            f"[ -e {shquote(self.path)} ] && break; "
-            f"sleep 0.1; "
-            f"done; "
-            f"[ -e {shquote(self.path)} ] || {{ echo 'Timeout waiting for {self.path} to appear' >&2; exit 1; }}"
-        )
-        inner_parts.append(verify_cmd)
-        
         # Combine inner parts
         inner_cmd = " && ".join(inner_parts)
-        
-        # Add random sleep before flock to avoid contention
-        sleep_duration = random.random()  # Random float between 0.0 and 1.0
         
         # Wrap entire command (including existence check) in flock
         if self.skip_existing:
             # Add skip message for when file exists
-            locked_cmd = f"sleep {sleep_duration} && flock -x {shquote(lockfile)} -c {shquote(inner_cmd)} || echo 'Skipping download, {self.path} already exists'"
+            locked_cmd = f"flock -x {shquote(lockfile)} -c {shquote(inner_cmd)} || echo 'Skipping download, {self.path} already exists'"
         else:
-            locked_cmd = f"sleep {sleep_duration} && flock -x {shquote(lockfile)} -c {shquote(inner_cmd)}"
+            locked_cmd = f"flock -x {shquote(lockfile)} -c {shquote(inner_cmd)}"
         
         return locked_cmd
 
@@ -339,7 +321,7 @@ class DownloadTaskBlock(TaskBlock):
         # If skip_existing is enabled, check if file already exists
         if self.skip_existing:
             # Skip download if file exists
-            return f"[ ! -e {shquote(self.local_path)} ] && {{ echo '{self.local_path} does not exist, downloading' >&2 && {download_cmd}; }} || echo 'Skipping download, {self.local_path} already exists'"
+            return f"[ ! -e {shquote(self.local_path)} ] && {{ {download_cmd}; }} || echo 'Skipping download, {self.local_path} already exists'"
         else:
             return download_cmd
 
@@ -387,7 +369,7 @@ class DownloadHFModelTaskBlock(TaskBlock):
         # If skip_existing is enabled, check if directory already exists and is non-empty
         if self.skip_existing:
             # Skip download if directory exists and is not empty
-            return f"[ ! -e {shquote(self.local_dir)} ] && {{ echo '{self.local_dir} does not exist, downloading' >&2 && {download_cmd}; }} || echo 'Skipping download, {self.local_dir} already exists'"
+            return f"[ ! -e {shquote(self.local_dir)} ] && {{ {download_cmd}; }} || echo 'Skipping download, {self.local_dir} already exists'"
         else:
             return download_cmd
 
@@ -458,15 +440,12 @@ class RsyncToGSTaskBlock(TaskBlock):
         # Combine inner parts
         inner_cmd = " && ".join(inner_parts)
         
-        # Add random sleep before flock to avoid contention
-        sleep_duration = random.random()  # Random float between 0.0 and 1.0
-        
         # Wrap entire command (including existence check) in flock
         if self.check_exists:
             # Add skip message for when remote path doesn't exist
-            locked_cmd = f"sleep {sleep_duration} && flock -x {shquote(lockfile)} -c {shquote(inner_cmd)} || echo 'Skipping rsync, remote path {dest_path} does not exist'"
+            locked_cmd = f"flock -x {shquote(lockfile)} -c {shquote(inner_cmd)} || echo 'Skipping rsync, remote path {dest_path} does not exist'"
         else:
-            locked_cmd = f"sleep {sleep_duration} && flock -x {shquote(lockfile)} -c {shquote(inner_cmd)}"
+            locked_cmd = f"flock -x {shquote(lockfile)} -c {shquote(inner_cmd)}"
         
         return locked_cmd
 
@@ -513,13 +492,12 @@ class RsyncFromGSTaskBlock(TaskBlock):
             dest_path = dest_path.rstrip('/')
         # If contents is None, leave paths as-is
 
-        # Build the inner command (all checks + mkdir + rsync + verification)
+        # Build the inner command (all checks + mkdir + rsync)
         inner_parts = []
         
         # If skip_existing is enabled, check if local path already exists
         if self.skip_existing:
             inner_parts.append(f"[ ! -e {shquote(self.path.rstrip('/'))} ]")
-            inner_parts.append(f"echo '{self.path} does not exist, syncing' >&2")
         
         # If check_exists is enabled, check if the remote path exists
         if self.check_exists:
@@ -545,25 +523,11 @@ class RsyncFromGSTaskBlock(TaskBlock):
         
         inner_parts.append(gsutil_cmd)
         
-        # Add verification loop to ensure directory appears on filesystem
-        verify_path = self.path.rstrip('/')
-        verify_cmd = (
-            f"for i in $(seq 1 300); do "
-            f"[ -e {shquote(verify_path)} ] && break; "
-            f"sleep 0.1; "
-            f"done; "
-            f"[ -e {shquote(verify_path)} ] || {{ echo 'Timeout waiting for {verify_path} to appear' >&2; exit 1; }}"
-        )
-        inner_parts.append(verify_cmd)
-        
         # Combine inner parts
         inner_cmd = " && ".join(inner_parts)
         
-        # Add random sleep before flock to avoid contention
-        sleep_duration = random.random()  # Random float between 0.0 and 1.0
-        
         # Wrap entire command (including all checks) in flock
-        locked_cmd = f"sleep {sleep_duration} && flock -x {shquote(lockfile)} -c {shquote(inner_cmd)}"
+        locked_cmd = f"flock -x {shquote(lockfile)} -c {shquote(inner_cmd)}"
         
         # Add appropriate skip message based on what checks are enabled
         if self.skip_existing and self.check_exists:
