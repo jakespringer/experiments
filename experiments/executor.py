@@ -264,6 +264,7 @@ class DownloadFromGSTaskBlock(TaskBlock):
         # If skip_existing is enabled, check if path already exists
         if self.skip_existing:
             inner_parts.append(f"[ ! -e {shquote(self.path)} ]")
+            inner_parts.append(f"echo '{self.path} does not exist, downloading' >&2")
         
         # Create necessary directories before download
         if self.directory:
@@ -338,7 +339,7 @@ class DownloadTaskBlock(TaskBlock):
         # If skip_existing is enabled, check if file already exists
         if self.skip_existing:
             # Skip download if file exists
-            return f"[ ! -e {shquote(self.local_path)} ] && {{ {download_cmd}; }} || echo 'Skipping download, {self.local_path} already exists'"
+            return f"[ ! -e {shquote(self.local_path)} ] && {{ echo '{self.local_path} does not exist, downloading' >&2 && {download_cmd}; }} || echo 'Skipping download, {self.local_path} already exists'"
         else:
             return download_cmd
 
@@ -386,7 +387,7 @@ class DownloadHFModelTaskBlock(TaskBlock):
         # If skip_existing is enabled, check if directory already exists and is non-empty
         if self.skip_existing:
             # Skip download if directory exists and is not empty
-            return f"[ ! -e {shquote(self.local_dir)} ] && {{ {download_cmd}; }} || echo 'Skipping download, {self.local_dir} already exists'"
+            return f"[ ! -e {shquote(self.local_dir)} ] && {{ echo '{self.local_dir} does not exist, downloading' >&2 && {download_cmd}; }} || echo 'Skipping download, {self.local_dir} already exists'"
         else:
             return download_cmd
 
@@ -518,6 +519,7 @@ class RsyncFromGSTaskBlock(TaskBlock):
         # If skip_existing is enabled, check if local path already exists
         if self.skip_existing:
             inner_parts.append(f"[ ! -e {shquote(self.path.rstrip('/'))} ]")
+            inner_parts.append(f"echo '{self.path} does not exist, syncing' >&2")
         
         # If check_exists is enabled, check if the remote path exists
         if self.check_exists:
