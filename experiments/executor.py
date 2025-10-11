@@ -275,12 +275,11 @@ class DownloadFromGSTaskBlock(TaskBlock):
         
         # Add verification loop to ensure file appears on filesystem
         verify_cmd = (
-            f"TIMEOUT=30; START=$(date +%s); "
-            f"while [ ! -e {shquote(self.path)} ]; do "
-            f"ELAPSED=$(($(date +%s) - START)); "
-            f"if [ $ELAPSED -ge $TIMEOUT ]; then "
-            f"echo 'Timeout waiting for {self.path} to appear' >&2; exit 1; fi; "
-            f"sleep 0.1; done"
+            f"for i in $(seq 1 300); do "
+            f"[ -e {shquote(self.path)} ] && break; "
+            f"sleep 0.1; "
+            f"done; "
+            f"[ -e {shquote(self.path)} ] || {{ echo 'Timeout waiting for {self.path} to appear' >&2; exit 1; }}"
         )
         inner_parts.append(verify_cmd)
         
@@ -537,12 +536,11 @@ class RsyncFromGSTaskBlock(TaskBlock):
         # Add verification loop to ensure directory appears on filesystem
         verify_path = self.path.rstrip('/')
         verify_cmd = (
-            f"TIMEOUT=30; START=$(date +%s); "
-            f"while [ ! -e {shquote(verify_path)} ]; do "
-            f"ELAPSED=$(($(date +%s) - START)); "
-            f"if [ $ELAPSED -ge $TIMEOUT ]; then "
-            f"echo 'Timeout waiting for {verify_path} to appear' >&2; exit 1; fi; "
-            f"sleep 0.1; done"
+            f"for i in $(seq 1 300); do "
+            f"[ -e {shquote(verify_path)} ] && break; "
+            f"sleep 0.1; "
+            f"done; "
+            f"[ -e {shquote(verify_path)} ] || {{ echo 'Timeout waiting for {verify_path} to appear' >&2; exit 1; }}"
         )
         inner_parts.append(verify_cmd)
         
