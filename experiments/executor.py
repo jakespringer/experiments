@@ -254,7 +254,7 @@ class DownloadFromGSTaskBlock(TaskBlock):
         path_hash = hashlib.sha256(self.path.encode("utf-8")).hexdigest()[:10]
         lockfile = f"/tmp/{path_hash}.lock"
 
-        # Build the inner command (existence check + download)
+        # Build the inner command (existence check + download + verification)
         inner_parts = []
         
         # If skip_existing is enabled, check if path already exists
@@ -272,6 +272,17 @@ class DownloadFromGSTaskBlock(TaskBlock):
             gsutil_cmd = f"gsutil cp {shquote(self.gs_path)} {shquote(self.path)}"
         
         inner_parts.append(gsutil_cmd)
+        
+        # Add verification loop to ensure file appears on filesystem
+        verify_cmd = (
+            f"TIMEOUT=30; START=$(date +%s); "
+            f"while [ ! -e {shquote(self.path)} ]; do "
+            f"ELAPSED=$(($(date +%s) - START)); "
+            f"if [ $ELAPSED -ge $TIMEOUT ]; then "
+            f"echo 'Timeout waiting for {self.path} to appear' >&2; exit 1; fi; "
+            f"sleep 0.1; done"
+        )
+        inner_parts.append(verify_cmd)
         
         # Combine inner parts
         inner_cmd = " && ".join(inner_parts)
@@ -492,7 +503,7 @@ class RsyncFromGSTaskBlock(TaskBlock):
             dest_path = dest_path.rstrip('/')
         # If contents is None, leave paths as-is
 
-        # Build the inner command (all checks + mkdir + rsync)
+        # Build the inner command (all checks + mkdir + rsync + verification)
         inner_parts = []
         
         # If skip_existing is enabled, check if local path already exists
@@ -522,6 +533,18 @@ class RsyncFromGSTaskBlock(TaskBlock):
         gsutil_cmd = " ".join(gsutil_cmd_parts)
         
         inner_parts.append(gsutil_cmd)
+        
+        # Add verification loop to ensure directory appears on filesystem
+        verify_path = self.path.rstrip('/')
+        verify_cmd = (
+            f"TIMEOUT=30; START=$(date +%s); "
+            f"while [ ! -e {shquote(verify_path)} ]; do "
+            f"ELAPSED=$(($(date +%s) - START)); "
+            f"if [ $ELAPSED -ge $TIMEOUT ]; then "
+            f"echo 'Timeout waiting for {verify_path} to appear' >&2; exit 1; fi; "
+            f"sleep 0.1; done"
+        )
+        inner_parts.append(verify_cmd)
         
         # Combine inner parts
         inner_cmd = " && ".join(inner_parts)
