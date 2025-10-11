@@ -7,6 +7,7 @@ import base64
 import hashlib
 import os
 from pathlib import Path
+import random
 from shlex import quote as shquote
 import subprocess
 import sys
@@ -229,8 +230,11 @@ class UploadToGSTaskBlock(TaskBlock):
         else:
             gsutil_cmd = f"gsutil cp {shquote(self.path)} {shquote(self.gs_path)}"
 
+        # Add random sleep before flock to avoid contention
+        sleep_duration = random.random()  # Random float between 0.0 and 1.0
+        
         # Wrap in an exclusive file lock to prevent race conditions
-        return f"flock -x {shquote(lockfile)} -c {shquote(gsutil_cmd)}"
+        return f"sleep {sleep_duration} && flock -x {shquote(lockfile)} -c {shquote(gsutil_cmd)}"
 
 
 class DownloadFromGSTaskBlock(TaskBlock):
@@ -286,12 +290,15 @@ class DownloadFromGSTaskBlock(TaskBlock):
         # Combine inner parts
         inner_cmd = " && ".join(inner_parts)
         
+        # Add random sleep before flock to avoid contention
+        sleep_duration = random.random()  # Random float between 0.0 and 1.0
+        
         # Wrap entire command (including existence check) in flock
         if self.skip_existing:
             # Add skip message for when file exists
-            locked_cmd = f"flock -x {shquote(lockfile)} -c {shquote(inner_cmd)} || echo 'Skipping download, {self.path} already exists'"
+            locked_cmd = f"sleep {sleep_duration} && flock -x {shquote(lockfile)} -c {shquote(inner_cmd)} || echo 'Skipping download, {self.path} already exists'"
         else:
-            locked_cmd = f"flock -x {shquote(lockfile)} -c {shquote(inner_cmd)}"
+            locked_cmd = f"sleep {sleep_duration} && flock -x {shquote(lockfile)} -c {shquote(inner_cmd)}"
         
         return locked_cmd
 
@@ -450,12 +457,15 @@ class RsyncToGSTaskBlock(TaskBlock):
         # Combine inner parts
         inner_cmd = " && ".join(inner_parts)
         
+        # Add random sleep before flock to avoid contention
+        sleep_duration = random.random()  # Random float between 0.0 and 1.0
+        
         # Wrap entire command (including existence check) in flock
         if self.check_exists:
             # Add skip message for when remote path doesn't exist
-            locked_cmd = f"flock -x {shquote(lockfile)} -c {shquote(inner_cmd)} || echo 'Skipping rsync, remote path {dest_path} does not exist'"
+            locked_cmd = f"sleep {sleep_duration} && flock -x {shquote(lockfile)} -c {shquote(inner_cmd)} || echo 'Skipping rsync, remote path {dest_path} does not exist'"
         else:
-            locked_cmd = f"flock -x {shquote(lockfile)} -c {shquote(inner_cmd)}"
+            locked_cmd = f"sleep {sleep_duration} && flock -x {shquote(lockfile)} -c {shquote(inner_cmd)}"
         
         return locked_cmd
 
@@ -547,8 +557,11 @@ class RsyncFromGSTaskBlock(TaskBlock):
         # Combine inner parts
         inner_cmd = " && ".join(inner_parts)
         
+        # Add random sleep before flock to avoid contention
+        sleep_duration = random.random()  # Random float between 0.0 and 1.0
+        
         # Wrap entire command (including all checks) in flock
-        locked_cmd = f"flock -x {shquote(lockfile)} -c {shquote(inner_cmd)}"
+        locked_cmd = f"sleep {sleep_duration} && flock -x {shquote(lockfile)} -c {shquote(inner_cmd)}"
         
         # Add appropriate skip message based on what checks are enabled
         if self.skip_existing and self.check_exists:
