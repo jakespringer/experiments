@@ -10,8 +10,7 @@ This example demonstrates:
 from dataclasses import dataclass
 from pathlib import Path
 from datetime import datetime, timedelta
-from experiments.artifact import Artifact
-from experiments.executor import SlurmExecutor
+from experiments import Artifact, SlurmExecutor, Task
 
 
 @dataclass

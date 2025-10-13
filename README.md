@@ -9,8 +9,10 @@ This framework lets you:
 - **Run massive grid searches** with minimal boilerplate
 - **Manage Slurm jobs** through a simple CLI
 - **Track experiment history** and view logs easily
+- **Skip completed work** automatically with smart exists checks
+- **Print commands** for sequential execution or debugging
 
-Instead of writing bash scripts and managing job dependencies manually, you define Python dataclasses that represent your experiments. The framework handles job submission, dependencies, and tracking automatically.
+Instead of writing bash scripts and managing job dependencies manually, you define Python dataclasses that represent your experiments. The framework handles job submission, dependencies, tracking, and skipping automatically.
 
 ## Quick Start
 
@@ -27,8 +29,8 @@ class PretrainedModel(Artifact):
     
     def get_requirements(self):
         return {
-            'partition': 'gpu',
-            'gpus': 'A100:4',
+            'partition': 'general',
+            'gpus': '4',
             'cpus': 8,
             'time': '24:00:00',
         }
@@ -79,14 +81,18 @@ python my_experiment.py drylaunch
 # Launch all jobs
 python my_experiment.py launch
 
-# Check status
+# Check status and history
 python my_experiment.py history
 
 # View logs for a specific job
 python my_experiment.py cat 12345
+python my_experiment.py cat 12345_0  # Specific array task
 
 # Cancel jobs
 python my_experiment.py cancel
+
+# Print commands for sequential execution
+python my_experiment.py print > commands.sh
 ```
 
 ## Key Features
@@ -94,7 +100,7 @@ python my_experiment.py cancel
 ### Automatic Dependencies
 
 Artifacts can depend on other artifacts. The framework automatically:
-- Computes the correct execution order
+- Computes the correct execution order via topological sort
 - Submits jobs in dependency-ordered tiers
 - Sets up Slurm dependencies between tiers
 
@@ -119,10 +125,47 @@ Artifacts with different resource requirements are automatically grouped into se
 # - Job 1: Models with 4 GPUs
 # - Job 2: Models with 8 GPUs
 models = [
-    Model(gpus=4, ...),  # Group 1
-    Model(gpus=4, ...),  # Group 1
-    Model(gpus=8, ...),  # Group 2
+    Model(gpus='4', ...),  # Group 1
+    Model(gpus='4', ...),  # Group 1
+    Model(gpus='8', ...),  # Group 2
 ]
+```
+
+### Automatic Skip Logic
+
+Artifacts can define existence checks to skip already-completed work:
+
+```python
+from pathlib import Path
+
+@dataclass(frozen=True)
+class TrainModel(Artifact):
+    model_name: str
+    epochs: int
+    
+    @property
+    def exists(self) -> bool:
+        """Check if the trained model already exists."""
+        model_path = Path(f"./models/{self.model_name}/checkpoint.pt")
+        return model_path.exists()
+    
+    def construct(self, builder: Task):
+        # Only runs if exists returns False
+        builder.run_command(f'python train.py --model {self.model_name}')
+```
+
+For advanced skip logic, override `should_skip()`:
+
+```python
+@dataclass(frozen=True)
+class TrainModel(Artifact):
+    use_cache: bool = True
+    
+    def should_skip(self) -> bool:
+        """Custom skip logic."""
+        if not self.use_cache:
+            return False  # Always run if caching disabled
+        return self.exists  # Otherwise check if exists
 ```
 
 ### Configuration Management
@@ -132,15 +175,17 @@ First run creates `~/.experiments/config.json`:
 ```json
 {
   "log_directory": "~/.experiments/logs",
+  "default_partition": "general",
   "default_slurm_args": {
-    "gpu": {
-      "time": "24:00:00",
-      "cpus": 8,
-      "requeue": true
+    "general": {
+      "time": "2-00:00:00",
+      "cpus": 1,
+      "requeue": false
     },
-    "cpu": {
-      "time": "4:00:00",
-      "cpus": 1
+    "array": {
+      "time": "2-00:00:00",
+      "cpus": 4,
+      "requeue": true
     }
   }
 }
@@ -157,6 +202,32 @@ Customize defaults per partition. Artifact-specific requirements override these.
 | `history` | View all submitted jobs |
 | `cat <job_id>` | View logs for a job |
 | `cancel [stages...]` | Cancel running jobs |
+| `print [stages...]` | Print commands for sequential execution |
+
+### CLI Options
+
+**launch/drylaunch/print options:**
+- `--head N` - Only run the first N artifacts
+- `--tail N` - Only run the last N artifacts
+- `--rerun` - Ignore exists check and rerun all artifacts
+- `--reverse` - Launch stages in reverse order (respects dependencies)
+- `--exclude STAGE [STAGE...]` - Exclude specific stages
+- `--artifact CLASS [CLASS...]` - Only run artifacts of specific types
+
+**Examples:**
+```bash
+# Launch only first 5 artifacts
+python script.py launch --head 5
+
+# Launch everything except pretrain stage
+python script.py launch --exclude pretrain
+
+# Only launch FinetunedModel artifacts
+python script.py launch --artifact FinetunedModel
+
+# Force rerun even if artifacts exist
+python script.py launch --rerun
+```
 
 ## Advanced Usage
 
@@ -164,10 +235,17 @@ Customize defaults per partition. Artifact-specific requirements override these.
 
 ```python
 # Stage 1: Pretrain
-pretrained = ArtifactSet.from_product(...)
+pretrained = ArtifactSet.from_product(
+    cls=PretrainedModel,
+    params={'lr': [1e-3, 1e-4], 'epochs': [10, 20]}
+)
 
 # Stage 2: Finetune (depends on pretrained)
-finetuned = ArtifactSet.join_product(pretrained, datasets).map(
+datasets = ['cifar10', 'cifar100']
+finetuned = ArtifactSet.join_product(
+    pretrained, 
+    ArtifactSet(datasets)
+).map(
     lambda model, dataset: FinetunedModel(base_model=model, dataset=dataset)
 )
 
@@ -178,12 +256,49 @@ executor.stage('finetune', finetuned)
 # python script.py launch finetune
 ```
 
-### Custom File Creation
+### ArtifactSet Operations
+
+```python
+# Cartesian product
+models = ArtifactSet.from_product(
+    cls=Model,
+    params={'lr': [1e-3, 1e-4], 'batch_size': [32, 64]}
+)
+
+# Join product (cross product of two sets)
+combined = ArtifactSet.join_product(models, datasets)
+
+# Map over items
+processed = combined.map(
+    lambda model, dataset: ProcessedData(model=model, dataset=dataset)
+)
+
+# Map and flatten
+expanded = models.map_flatten(
+    lambda model: ArtifactSet.from_product(
+        cls=Variant,
+        params={'model': model, 'variant': ['a', 'b', 'c']}
+    )
+)
+
+# Concatenate sets
+all_models = models_a + models_b
+
+# Map-reduce
+total = artifacts.map_reduce(
+    map_fn=lambda a: a.compute_metric(),
+    reduce_fn=sum
+)
+```
+
+### Task Building Blocks
+
+#### File Creation
 
 ```python
 def construct(self, builder: Task):
     # YAML file
-    builder.create_yaml_file('config.yaml', {...})
+    builder.create_yaml_file('config.yaml', {'lr': 0.001, 'epochs': 10})
     
     # Plain text file
     builder.create_file('script.sh', '#!/bin/bash\necho hello')
@@ -192,34 +307,154 @@ def construct(self, builder: Task):
     builder.create_file('data.bin', b'\x00\x01\x02')
 ```
 
-### Commands with Arguments
+#### Commands with Arguments
 
 ```python
 builder.run_command(
     'python train.py',
+    vargs=['arg1', 'arg2'],  # Positional arguments
     kwargs={
         'config': 'config.yaml',
         'output': '/data/output',
         'lr': 0.001,
     },
-    kwformat='--{k}={v}'  # Produces: --config=config.yaml --output=/data/output --lr=0.001
+    vformat='{v}',  # Format for positional args
+    kwformat='--{k}={v}'  # Format for keyword args
+)
+# Produces: python train.py arg1 arg2 --config=config.yaml --output=/data/output --lr=0.001
+```
+
+#### Google Cloud Storage
+
+```python
+# Upload file
+builder.upload_to_gs('/local/path/model.pt', 'gs://bucket/models/model.pt')
+
+# Upload directory
+builder.upload_to_gs('/local/path/model', 'gs://bucket/models/', directory=True)
+
+# Download file
+builder.download_from_gs('gs://bucket/data/dataset.tar', '/local/dataset.tar')
+
+# Download directory
+builder.download_from_gs('gs://bucket/data/', '/local/data', directory=True)
+
+# Rsync upload (with smart sync)
+builder.rsync_to_gs(
+    '/local/checkpoints',
+    'gs://bucket/checkpoints',
+    delete=False,  # Don't delete remote files not in source
+    checksum=True  # Use checksum instead of mtime
+)
+
+# Rsync download
+builder.rsync_from_gs(
+    'gs://bucket/checkpoints',
+    '/local/checkpoints',
+    delete=False,
+    skip_existing=True
 )
 ```
 
-### Cloud Storage Integration
+#### Other Operations
 
 ```python
-# Upload results to Google Cloud Storage
-builder.upload_to_gs(
-    '/local/path/model',
-    'gs://bucket/models/my-model'
+# Download from web
+builder.download('https://example.com/data.tar.gz', '/local/data.tar.gz')
+
+# Download Hugging Face model
+builder.download_hf_model('bert-base-uncased', '/local/models/bert')
+
+# Create directory
+builder.ensure_directory('/path/to/dir')
+
+# Set environment variable
+builder.set_env('CUDA_VISIBLE_DEVICES', '0,1,2,3')
+
+# Set from command output
+builder.set_env('NUM_GPUS', 'nvidia-smi --list-gpus | wc -l', from_command=True)
+```
+
+### Slurm Resource Requirements
+
+All valid Slurm options are supported:
+
+```python
+def get_requirements(self):
+    return {
+        # Basic
+        'partition': 'gpu',
+        'time': '24:00:00',
+        'account': 'myaccount',
+        'qos': 'high',
+        
+        # Resources
+        'nodes': 1,
+        'ntasks': 1,
+        'cpus': 8,  # or 'cpus_per_task'
+        'mem': '32G',
+        'mem_per_cpu': '4G',
+        
+        # GPUs (modern format)
+        'gpus': '4',  # or 'A100:4'
+        
+        # GPUs (older format)
+        'gres': 'gpu:4',
+        'constraint': 'a100',
+        
+        # Job control
+        'requeue': True,
+        'signal': 'B:USR1@60',
+        
+        # Logs
+        'output': '/custom/path/out_%A_%a.log',
+        'error': '/custom/path/err_%A_%a.log',
+        'separate_error': True,
+        
+        # Email
+        'mail_type': 'END,FAIL',
+        'mail_user': 'user@example.com',
+    }
+```
+
+### Setup Commands
+
+Run initialization code before each task:
+
+```python
+executor = SlurmExecutor(
+    project='my-experiment',
+    artifact_path='/data/outputs',
+    code_path='/code',
+    setup_command='''
+        source ~/miniconda3/etc/profile.d/conda.sh
+        conda activate myenv
+        export PYTHONPATH=$PYTHONPATH:/code
+    '''
+)
+```
+
+### PrintExecutor for Debugging
+
+Use `PrintExecutor` to generate bash scripts instead of submitting to Slurm:
+
+```python
+from experiments import PrintExecutor
+
+executor = PrintExecutor(
+    artifact_path='/data/outputs',
+    code_path='/code',
+    setup_command='source activate myenv'
 )
 
-# Download data from GCS
-builder.download_from_gs(
-    'gs://bucket/data/dataset.tar',
-    '/local/path/dataset.tar'
-)
+executor.stage('train', models)
+executor.execute(['train'])  # Prints bash commands to stdout
+```
+
+Or use the CLI:
+```bash
+python script.py print > commands.sh
+bash commands.sh  # Run sequentially
 ```
 
 ## Installation
@@ -233,23 +468,32 @@ pip install -e .
 ```
 experiments/
 ├── artifact.py      # Artifact and ArtifactSet classes
-├── executor.py      # Slurm executor and task builders
-└── cli.py           # Command-line interface
+├── executor.py      # SlurmExecutor, PrintExecutor, Task
+├── cli.py           # Command-line interface
+└── utils.py         # Helper functions
 
 ~/.experiments/
 ├── config.json      # Global configuration
 ├── logs/            # Job log files
 └── projects/        # Per-project job tracking
     └── my-project/
-        └── pretrain/
+        ├── pretrain/
+        │   └── jobs.json
+        └── finetune/
             └── jobs.json
 ```
 
 ## Examples
 
 See `examples/` for complete examples:
-- `multistage_training.py` - Multi-stage ML pipeline
-- `olmo/gridsearch.py` - Large-scale LLM training
+
+### Basic Examples
+- `exists_demo.py` - Using the exists property to skip completed artifacts
+- `skip_conditions_demo.py` - Advanced skip conditions and custom logic
+
+### Advanced Examples
+- `multistage_training.py` - Multi-stage ML pipeline with pretraining and finetuning
+- `olmo/gridsearch.py` - Large-scale LLM training grid search
 
 ## Requirements
 
@@ -257,12 +501,146 @@ See `examples/` for complete examples:
 - Slurm cluster
 - PyYAML
 
+Optional:
+- Google Cloud SDK (for GCS features)
+- Hugging Face CLI (for HF model downloads)
+
+## Best Practices
+
+### Use Frozen Dataclasses
+
+Make artifacts immutable and hashable:
+```python
+@dataclass(frozen=True)
+class MyArtifact(Artifact):
+    param1: str
+    param2: int
+```
+
+### Artifact Paths
+
+Artifact paths are automatically generated from class name and parameters:
+```python
+model = PretrainedModel(learning_rate=0.001, epochs=10)
+print(model.relpath)  # "PretrainedModel/a1b2c3d4e5"
+```
+
+The hash ensures unique paths for different parameter combinations.
+
+### Override relpath for Custom Naming
+
+```python
+@dataclass(frozen=True)
+class MyModel(Artifact):
+    name: str
+    version: int
+    
+    @property
+    def relpath(self) -> str:
+        return f'MyModel/{self.name}_v{self.version}'
+```
+
+### Test with drylaunch
+
+Always verify your experiment plan before launching:
+```bash
+python script.py drylaunch
+```
+
+This shows:
+- How many jobs will be submitted
+- How tasks are grouped by resources
+- Dependency relationships
+- Which artifacts will be skipped
+
+### Use Stages for Organization
+
+Organize related artifacts into stages:
+```python
+executor.stage('download', download_tasks)
+executor.stage('preprocess', preprocess_tasks)
+executor.stage('train', train_tasks)
+executor.stage('eval', eval_tasks)
+```
+
+Then launch specific stages:
+```bash
+python script.py launch train eval  # Only train and eval
+python script.py launch --exclude download  # Everything except download
+```
+
+### Efficient Grid Searches
+
+Use `from_product` for parameter sweeps:
+```python
+models = ArtifactSet.from_product(
+    cls=Model,
+    params={
+        'lr': [1e-3, 1e-4, 1e-5],
+        'batch_size': [16, 32, 64],
+        'optimizer': ['adam', 'sgd'],
+    }
+)
+# Creates 3 × 3 × 2 = 18 models
+```
+
+### Handle Large Experiments
+
+For experiments with many artifacts, use filtering:
+```bash
+# Test with a small subset first
+python script.py launch --head 5
+
+# Launch in batches
+python script.py launch --head 100
+python script.py launch --tail 100
+```
+
+### Track Progress
+
+Monitor your experiments:
+```bash
+# View all submitted jobs
+python script.py history
+
+# Check specific job logs
+squeue -u $USER  # See running jobs
+python script.py cat <job_id>_<array_index>
+
+# Cancel if needed
+python script.py cancel
+```
+
 ## Tips
 
-- Use `@dataclass(frozen=True)` for immutable, hashable artifacts
-- Artifact paths are automatically generated from their parameters
-- Jobs are tracked in `~/.experiments/projects/{project}/` for easy history viewing
-- Use `drylaunch` to verify your setup before launching expensive jobs
+- Jobs are tracked in `~/.experiments/projects/{project}/` for history viewing
+- Log files use pattern: `{log_dir}/{job_name}_{job_id}_{array_index}.log`
+- Array jobs automatically map array index to task
+- Dependencies use `afterok` to ensure successful completion
+- File operations use `flock` for safe concurrent access
+- Skipped artifacts still participate in dependency resolution
+
+## Troubleshooting
+
+### Jobs not starting
+- Check dependencies: `python script.py drylaunch` shows dependency graph
+- Verify partitions and resources are valid for your cluster
+- Check `squeue -u $USER` for job status
+
+### Artifacts keep rerunning
+- Verify `exists` property is implemented correctly
+- Check file paths match between `exists` and `construct`
+- Use `--rerun` flag if you want to force rerun
+
+### Import errors in jobs
+- Use `setup_command` to activate environments
+- Set `PYTHONPATH` if needed
+- Verify `code_path` points to your source code
+
+### Out of memory
+- Adjust `mem` or `mem_per_cpu` in `get_requirements()`
+- Reduce batch sizes or model sizes
+- Request nodes with more memory
 
 ## License
 

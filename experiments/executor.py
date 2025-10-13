@@ -603,7 +603,7 @@ class Executor:
         selected = list(args.stages) if args.stages else list(self._stages.keys())
         self.execute(selected)
 
-    def execute(self, stages: List[str], head: int | None = None, tail: int | None = None, rerun: bool = False) -> None:
+    def execute(self, stages: List[str], head: int | None = None, tail: int | None = None, rerun: bool = False, artifacts: List[str] | None = None) -> None:
         """Execute the specified stages (or all stages if empty list).
         
         Args:
@@ -611,6 +611,7 @@ class Executor:
             head: If provided, only execute the first N artifacts
             tail: If provided, only execute the last N artifacts
             rerun: If True, ignore exists check and run all artifacts
+            artifacts: If provided, only execute artifacts with these class names
         """
         # Validate inputs
         if not self._stages:
@@ -646,6 +647,14 @@ class Executor:
         if not filtered_tiers:
             print("No artifacts matched the selected stages.", file=sys.stderr)
             return
+        
+        # Filter by artifact class names if specified
+        if artifacts:
+            filtered_tiers = self._filter_tiers_by_artifact_class(filtered_tiers, artifacts)
+            
+            if not filtered_tiers:
+                print(f"No artifacts matched the specified types: {', '.join(artifacts)}", file=sys.stderr)
+                return
 
         # Filter out artifacts that should be skipped (e.g., already exist)
         # unless rerun flag is set
@@ -737,6 +746,34 @@ class Executor:
             filtered_tier = [
                 a for a in tier
                 if artifact_to_stages.get(id(a), set()) & selected_set
+            ]
+            if filtered_tier:
+                filtered_tiers.append(filtered_tier)
+        
+        return filtered_tiers
+    
+    def _filter_tiers_by_artifact_class(
+        self,
+        tiers: List[List[Artifact]],
+        artifact_classes: List[str],
+    ) -> List[List[Artifact]]:
+        """Filter artifact tiers to only include artifacts with matching class names.
+        
+        Args:
+            tiers: List of artifact tiers
+            artifact_classes: List of artifact class names to include
+            
+        Returns:
+            Filtered list of artifact tiers containing only matching artifacts
+        """
+        artifact_class_set = set(artifact_classes)
+        filtered_tiers: List[List[Artifact]] = []
+        
+        for tier in tiers:
+            # Keep artifacts whose class name matches one of the specified names
+            filtered_tier = [
+                a for a in tier
+                if a.__class__.__name__ in artifact_class_set
             ]
             if filtered_tier:
                 filtered_tiers.append(filtered_tier)

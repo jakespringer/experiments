@@ -7,8 +7,7 @@ that have already been executed.
 
 from dataclasses import dataclass
 from pathlib import Path
-from experiments.artifact import Artifact
-from experiments.executor import SlurmExecutor
+from experiments import Artifact, SlurmExecutor, Task
 
 
 @dataclass
