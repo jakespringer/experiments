@@ -652,9 +652,14 @@ class Executor:
         
         # Report skipped artifacts
         if skipped_artifacts:
+            # Build mapping of artifact ID to stage names for display
+            artifact_to_stages = self._build_artifact_to_stages_mapping()
+            
             print(f"Skipping {len(skipped_artifacts)} artifact(s) that already exist:", file=sys.stderr)
             for artifact in skipped_artifacts:
-                print(f"  - {artifact.__class__.__name__} ({artifact.relpath})", file=sys.stderr)
+                stage_names = sorted(artifact_to_stages.get(id(artifact), set()) & set(stages))
+                stage_str = f" [stages: {', '.join(stage_names)}]" if stage_names else ""
+                print(f"  - {artifact.__class__.__name__} ({artifact.relpath}){stage_str}", file=sys.stderr)
             print(file=sys.stderr)
         
         if not executable_tiers:
@@ -701,6 +706,14 @@ class Executor:
                     unique_artifacts.append(artifact)
         
         return unique_artifacts
+
+    def _build_artifact_to_stages_mapping(self) -> Dict[int, Set[str]]:
+        """Build a mapping from artifact ID to the set of stage names it belongs to."""
+        artifact_to_stages: Dict[int, Set[str]] = {}
+        for stage_name, artifacts in self._stages.items():
+            for artifact in artifacts:
+                artifact_to_stages.setdefault(id(artifact), set()).add(stage_name)
+        return artifact_to_stages
 
     def _filter_tiers_by_stages(
         self,
@@ -1181,12 +1194,16 @@ class SlurmExecutor(Executor):
             )
             num_remaining = len(tasks) - num_complete
             
+            # Determine which stage this group belongs to
+            group_stage = self._determine_group_stage(tasks, stage_names)
+            
             # Build job info
             job_info = {
                 'job_id': job_id,
                 'job_name': job_name,
                 'tier': tier_index,
                 'group': group_index,
+                'stage': group_stage,
                 'num_tasks': len(tasks),
                 'num_complete': num_complete,
                 'num_remaining': num_remaining,
@@ -1204,9 +1221,6 @@ class SlurmExecutor(Executor):
             
             # Save job info to persistent storage (if config manager available and project set)
             if self.config_manager and self.project and not self.dry_run:
-                # Determine which stage this specific group belongs to
-                # by checking which stage the artifacts in this group belong to
-                group_stage = self._determine_group_stage(tasks, stage_names)
                 if group_stage:
                     self.config_manager.save_job_info(self.project, group_stage, job_info)
             
@@ -1216,7 +1230,8 @@ class SlurmExecutor(Executor):
                 artifact_types = sorted(set(artifact_classes))
                 artifact_summary = ', '.join(artifact_types) if artifact_types else 'N/A'
                 
-                print(f"✓ Submitted job {job_id}: {job_name}", file=sys.stderr)
+                stage_str = f" [{group_stage}]" if group_stage else ""
+                print(f"✓ Submitted job {job_id}: {job_name}{stage_str}", file=sys.stderr)
                 print(f"  Tasks: {len(tasks)}, Artifacts: {artifact_summary}", file=sys.stderr)
                 print(f"  Config: partition={slurm_config.get('partition', 'N/A')}, "
                       f"cpus={slurm_config.get('cpus', 'N/A')}, "
@@ -1622,6 +1637,11 @@ class SlurmExecutor(Executor):
             
             for job in tier_jobs:
                 print(f"  Job {job['job_id']}: {job['job_name']}", file=sys.stderr)
+                
+                # Show stage if available
+                if job.get('stage'):
+                    print(f"    Stage: {job['stage']}", file=sys.stderr)
+                
                 print(f"    Tasks: {job['num_tasks']}", file=sys.stderr)
                 
                 # Show unique artifact types in this job

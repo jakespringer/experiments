@@ -103,6 +103,19 @@ class ArtifactSet(Sequence[Any]):
     def __getitem__(self, idx: int) -> Any:
         return self._items[idx]
 
+    def __add__(self, other: "ArtifactSet") -> "ArtifactSet":
+        """Add two ArtifactSets together to create a union.
+        
+        Args:
+            other: Another ArtifactSet to combine with this one
+            
+        Returns:
+            A new ArtifactSet containing all items from both sets
+        """
+        if not isinstance(other, ArtifactSet):
+            return NotImplemented
+        return ArtifactSet(list(self._items) + list(other._items))
+
     @staticmethod
     def _cartesian_dicts(params: Dict[str, Any]) -> List[Dict[str, Any]]:
         keys = list(params.keys())
