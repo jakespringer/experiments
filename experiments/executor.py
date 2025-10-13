@@ -6,13 +6,14 @@ import argparse
 import base64
 import hashlib
 import os
-from pathlib import Path
-from shlex import quote as shquote
 import subprocess
 import sys
+import json
 import tempfile
-
 import yaml
+
+from pathlib import Path
+from shlex import quote as shquote
 
 from .artifact import Artifact, ArtifactSet
 
@@ -1078,7 +1079,8 @@ class SlurmExecutor(Executor):
             tiers: List of task tiers to execute
             tier_to_stages: Optional mapping from tier index to list of stage names
         """
-        previous_tier_job_ids: List[str] = []
+        # Map artifact ID to the job ID that produces it
+        artifact_to_job_id: Dict[int, str] = {}
         all_job_ids: List[str] = []
         
         if self.dry_run:
@@ -1098,19 +1100,20 @@ class SlurmExecutor(Executor):
             stage_names = tier_to_stages.get(tier_index, []) if tier_to_stages else []
             
             # Submit this tier (may create multiple jobs if requirements differ)
-            # and get all job IDs created
-            current_tier_job_ids = self._submit_tier(
+            # and get mapping of artifacts to their job IDs
+            job_mappings = self._submit_tier(
                 tier_index,
                 tier,
-                dependency_job_ids=previous_tier_job_ids,
+                artifact_to_job_id=artifact_to_job_id,
                 stage_names=stage_names,
             )
             
-            # Track all submitted jobs
-            all_job_ids.extend(current_tier_job_ids)
+            # Track all submitted jobs (deduplicate since multiple artifacts can map to same job)
+            tier_job_ids = sorted(set(job_mappings.values()))
+            all_job_ids.extend(tier_job_ids)
             
-            # These jobs become dependencies for the next tier
-            previous_tier_job_ids = current_tier_job_ids
+            # Update artifact-to-job mapping with new jobs from this tier
+            artifact_to_job_id.update(job_mappings)
         
         # Print summary for dry run
         if self.dry_run:
@@ -1123,30 +1126,31 @@ class SlurmExecutor(Executor):
         self,
         tier_index: int,
         tier: List[Task],
-        dependency_job_ids: List[str],
+        artifact_to_job_id: Dict[int, str],
         stage_names: List[str] | None = None,
-    ) -> List[str]:
+    ) -> Dict[int, str]:
         """Submit a tier as one or more Slurm array jobs.
         
         If tasks have different requirements, they are grouped and submitted
-        as separate jobs. All jobs in this tier depend on all jobs from the
-        previous tier.
+        as separate jobs. Each job only depends on the specific jobs that
+        produce artifacts it needs.
         
         Args:
             tier_index: Index of the tier
             tier: List of tasks in the tier
-            dependency_job_ids: Job IDs this tier depends on
+            artifact_to_job_id: Mapping of artifact IDs to job IDs that produce them
             stage_names: Optional list of stage names for this tier
         
         Returns:
-            List of job IDs created for this tier
+            Dictionary mapping artifact IDs to job IDs for tasks in this tier
         """
         from datetime import datetime
         
         # Group tasks by their requirements
         task_groups = self._group_tasks_by_requirements(tier)
         
-        submitted_job_ids: List[str] = []
+        # Track which artifacts are produced by which job in this tier
+        new_mappings: Dict[int, str] = {}
         
         # Submit a separate job for each requirement group
         for group_index, (requirements, tasks) in enumerate(task_groups.items()):
@@ -1156,6 +1160,9 @@ class SlurmExecutor(Executor):
             
             # Get Slurm configuration for this group
             slurm_config = self._build_slurm_config(requirements)
+            
+            # Compute dependencies for this specific group
+            dependency_job_ids = self._compute_dependencies_for_tasks(tasks, artifact_to_job_id)
             
             # Generate the sbatch script
             sbatch_header = self._build_sbatch_header(
@@ -1171,7 +1178,11 @@ class SlurmExecutor(Executor):
             
             # Submit the job (or fake it in dry run mode)
             job_id = self._submit_sbatch_script(script_path)
-            submitted_job_ids.append(job_id)
+            
+            # Map all artifacts in this group to this job ID
+            for task in tasks:
+                if task.artifact is not None:
+                    new_mappings[id(task.artifact)] = job_id
             
             # Extract log file from header
             log_file = None
@@ -1239,7 +1250,37 @@ class SlurmExecutor(Executor):
                       f"time={slurm_config.get('time', 'N/A')}", file=sys.stderr)
                 print(file=sys.stderr)
         
-        return submitted_job_ids
+        return new_mappings
+    
+    def _compute_dependencies_for_tasks(
+        self,
+        tasks: List[Task],
+        artifact_to_job_id: Dict[int, str],
+    ) -> List[str]:
+        """Compute the set of job IDs that these tasks depend on.
+        
+        Args:
+            tasks: List of tasks to compute dependencies for
+            artifact_to_job_id: Mapping of artifact IDs to job IDs that produce them
+        
+        Returns:
+            Sorted list of unique job IDs that these tasks depend on
+        """
+        dependency_job_ids: Set[str] = set()
+        
+        for task in tasks:
+            if task.artifact is None:
+                continue
+            
+            # Find all artifacts this task depends on
+            for attr_value in vars(task.artifact).values():
+                for dependency in _find_artifact_dependencies(attr_value):
+                    dependency_id = id(dependency)
+                    # If we've already submitted a job for this dependency, add it
+                    if dependency_id in artifact_to_job_id:
+                        dependency_job_ids.add(artifact_to_job_id[dependency_id])
+        
+        return sorted(dependency_job_ids)
     
     def _determine_group_stage(self, tasks: List[Task], stage_names: List[str]) -> str | None:
         """Determine which stage this group of tasks belongs to.
