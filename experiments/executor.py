@@ -17,6 +17,22 @@ from shlex import quote as shquote
 
 from .artifact import Artifact, ArtifactSet
 
+
+def dquote(s: str) -> str:
+    """Quote a string using double quotes, allowing environment variable expansion.
+    
+    Only escapes characters that would break the double-quoted string:
+    backslash, double quote, and backtick. Dollar signs are NOT escaped,
+    allowing $VAR to expand.
+    """
+    # Escape backslash first (must be first!)
+    s = s.replace('\\', '\\\\')
+    # Escape double quotes
+    s = s.replace('"', '\\"')
+    # Escape backticks (command substitution)
+    s = s.replace('`', '\\`')
+    return f'"{s}"'
+
 class Directive(ABC):
     """Wrapper for executor-specific values that should pass-through behavior."""
 
@@ -154,8 +170,9 @@ class CommandTaskBlock(TaskBlock):
         
         # Add keyword arguments
         if self.kwargs:
+            kwargs_filtered = {k: v for k, v in self.kwargs.items() if v is not None}
             kwargs_str = ' '.join(
-                self.kwformat.format(k=k, v=v) for k, v in self.kwargs.items()
+                self.kwformat.format(k=k, v=v) for k, v in kwargs_filtered.items()
             )
             parts.append(kwargs_str)
         
@@ -193,14 +210,14 @@ class CreateFileTaskBlock(TaskBlock):
         # Create parent directory if needed
         if self.mkdirs:
             parent = os.path.dirname(self.path) or "."
-            parts.append(f"mkdir -p -- {shquote(parent)}")
+            parts.append(f"mkdir -p -- {dquote(parent)}")
 
         # Write file using base64 decoding
-        parts.append(f"base64 -d > {shquote(self.path)} << '{delim}'\n{b64}\n{delim}")
+        parts.append(f"base64 -d > {dquote(self.path)} << '{delim}'\n{b64}\n{delim}")
 
         # Set file permissions if specified
         if self.mode is not None:
-            parts.append(f"chmod {self.mode} {shquote(self.path)}")
+            parts.append(f"chmod {self.mode} {dquote(self.path)}")
         
         return " && ".join(parts)
 
@@ -226,12 +243,12 @@ class UploadToGSTaskBlock(TaskBlock):
         # Build the gsutil command
         if self.directory:
             # Use -m for parallel operations and -r for recursive
-            gsutil_cmd = f"gsutil -m cp -r {shquote(self.path)} {shquote(self.gs_path)}"
+            gsutil_cmd = f"gsutil -m cp -r {dquote(self.path)} {dquote(self.gs_path)}"
         else:
-            gsutil_cmd = f"gsutil cp {shquote(self.path)} {shquote(self.gs_path)}"
+            gsutil_cmd = f"gsutil cp {dquote(self.path)} {dquote(self.gs_path)}"
 
         # Wrap in an exclusive file lock to prevent race conditions
-        return f"flock -x {shquote(lockfile)} -c {shquote(gsutil_cmd)}"
+        return f"flock -x {dquote(lockfile)} -c {dquote(gsutil_cmd)}"
 
 
 class DownloadFromGSTaskBlock(TaskBlock):
@@ -260,17 +277,17 @@ class DownloadFromGSTaskBlock(TaskBlock):
         
         # If skip_existing is enabled, check if path already exists
         if self.skip_existing:
-            inner_parts.append(f"[ ! -e {shquote(self.path)} ]")
+            inner_parts.append(f"[ ! -e {dquote(self.path)} ]")
         
         # Create necessary directories before download
         if self.directory:
-            inner_parts.append(f"mkdir -p -- {shquote(self.path)}")
+            inner_parts.append(f"mkdir -p -- {dquote(self.path)}")
             # Use -m for parallel operations and -r for recursive
-            gsutil_cmd = f"gsutil -m cp -r {shquote(self.gs_path)} {shquote(self.path)}"
+            gsutil_cmd = f"gsutil -m cp -r {dquote(self.gs_path)} {dquote(self.path)}"
         else:
             parent = os.path.dirname(self.path) or "."
-            inner_parts.append(f"mkdir -p -- {shquote(parent)}")
-            gsutil_cmd = f"gsutil cp {shquote(self.gs_path)} {shquote(self.path)}"
+            inner_parts.append(f"mkdir -p -- {dquote(parent)}")
+            gsutil_cmd = f"gsutil cp {dquote(self.gs_path)} {dquote(self.path)}"
         
         inner_parts.append(gsutil_cmd)
         
@@ -280,9 +297,9 @@ class DownloadFromGSTaskBlock(TaskBlock):
         # Wrap entire command (including existence check) in flock
         if self.skip_existing:
             # Add skip message for when file exists
-            locked_cmd = f"flock -x {shquote(lockfile)} -c {shquote(inner_cmd)} || echo 'Skipping download, {self.path} already exists'"
+            locked_cmd = f"flock -x {dquote(lockfile)} -c {dquote(inner_cmd)} || echo \"Skipping download, {self.path} already exists\""
         else:
-            locked_cmd = f"flock -x {shquote(lockfile)} -c {shquote(inner_cmd)}"
+            locked_cmd = f"flock -x {dquote(lockfile)} -c {dquote(inner_cmd)}"
         
         return locked_cmd
 
@@ -309,12 +326,12 @@ class DownloadTaskBlock(TaskBlock):
         # Create parent directory if needed
         if self.mkdirs:
             parent = os.path.dirname(self.local_path) or "."
-            parts.append(f"mkdir -p -- {shquote(parent)}")
+            parts.append(f"mkdir -p -- {dquote(parent)}")
         
         # Build the curl command
         # -L: follow redirects
         # -o: output file
-        curl_cmd = f"curl -L {shquote(self.url)} -o {shquote(self.local_path)}"
+        curl_cmd = f"curl -L {dquote(self.url)} -o {dquote(self.local_path)}"
         parts.append(curl_cmd)
         
         download_cmd = " && ".join(parts)
@@ -322,7 +339,7 @@ class DownloadTaskBlock(TaskBlock):
         # If skip_existing is enabled, check if file already exists
         if self.skip_existing:
             # Skip download if file exists
-            return f"[ ! -e {shquote(self.local_path)} ] && {{ {download_cmd}; }} || echo 'Skipping download, {self.local_path} already exists'"
+            return f"[ ! -e {dquote(self.local_path)} ] && {{ {download_cmd}; }} || echo \"Skipping download, {self.local_path} already exists\""
         else:
             return download_cmd
 
@@ -335,7 +352,7 @@ class EnsureDirectoryTaskBlock(TaskBlock):
 
     def execute(self) -> str:
         """Generate shell command to create the directory."""
-        return f"mkdir -p -- {shquote(self.path)}"
+        return f"mkdir -p -- {dquote(self.path)}"
 
 
 class DownloadHFModelTaskBlock(TaskBlock):
@@ -359,10 +376,10 @@ class DownloadHFModelTaskBlock(TaskBlock):
         
         # Create directory if needed
         if self.mkdirs:
-            parts.append(f"mkdir -p -- {shquote(self.local_dir)}")
+            parts.append(f"mkdir -p -- {dquote(self.local_dir)}")
         
         # Build the hf download command
-        hf_cmd = f"hf download {shquote(self.model_name)} --local-dir {shquote(self.local_dir)}"
+        hf_cmd = f"hf download {dquote(self.model_name)} --local-dir {dquote(self.local_dir)}"
         parts.append(hf_cmd)
         
         download_cmd = " && ".join(parts)
@@ -370,7 +387,7 @@ class DownloadHFModelTaskBlock(TaskBlock):
         # If skip_existing is enabled, check if directory already exists and is non-empty
         if self.skip_existing:
             # Skip download if directory exists and is not empty
-            return f"[ ! -e {shquote(self.local_dir)} ] && {{ {download_cmd}; }} || echo 'Skipping download, {self.local_dir} already exists'"
+            return f"[ ! -e {dquote(self.local_dir)} ] && {{ {download_cmd}; }} || echo \"Skipping download, {self.local_dir} already exists\""
         else:
             return download_cmd
 
@@ -420,7 +437,7 @@ class RsyncToGSTaskBlock(TaskBlock):
         
         # If check_exists is enabled, check if the remote path exists
         if self.check_exists:
-            inner_parts.append(f"gsutil -q ls {shquote(dest_path)} > /dev/null 2>&1")
+            inner_parts.append(f"gsutil -q ls {dquote(dest_path)} > /dev/null 2>&1")
         
         # Build the gsutil rsync command
         # -r for recursive sync, -m for parallel operations
@@ -433,7 +450,7 @@ class RsyncToGSTaskBlock(TaskBlock):
             gsutil_cmd_parts.append("-c")  # Use checksum instead of mtime
         
         # Add source and destination
-        gsutil_cmd_parts.extend([shquote(source_path), shquote(dest_path)])
+        gsutil_cmd_parts.extend([dquote(source_path), dquote(dest_path)])
         gsutil_cmd = " ".join(gsutil_cmd_parts)
         
         inner_parts.append(gsutil_cmd)
@@ -444,9 +461,9 @@ class RsyncToGSTaskBlock(TaskBlock):
         # Wrap entire command (including existence check) in flock
         if self.check_exists:
             # Add skip message for when remote path doesn't exist
-            locked_cmd = f"flock -x {shquote(lockfile)} -c {shquote(inner_cmd)} || echo 'Skipping rsync, remote path {dest_path} does not exist'"
+            locked_cmd = f"flock -x {dquote(lockfile)} -c {dquote(inner_cmd)} || echo \"Skipping rsync, remote path {dest_path} does not exist\""
         else:
-            locked_cmd = f"flock -x {shquote(lockfile)} -c {shquote(inner_cmd)}"
+            locked_cmd = f"flock -x {dquote(lockfile)} -c {dquote(inner_cmd)}"
         
         return locked_cmd
 
@@ -498,15 +515,15 @@ class RsyncFromGSTaskBlock(TaskBlock):
         
         # If skip_existing is enabled, check if local path already exists
         if self.skip_existing:
-            inner_parts.append(f"[ ! -e {shquote(self.path.rstrip('/'))} ]")
+            inner_parts.append(f"[ ! -e {dquote(self.path.rstrip('/'))} ]")
         
         # If check_exists is enabled, check if the remote path exists
         if self.check_exists:
-            inner_parts.append(f"gsutil -q ls {shquote(source_path)} > /dev/null 2>&1")
+            inner_parts.append(f"gsutil -q ls {dquote(source_path)} > /dev/null 2>&1")
         
         # Create necessary directory before sync
         # Use the original path (without trailing slash) for mkdir
-        inner_parts.append(f"mkdir -p -- {shquote(self.path.rstrip('/'))}")
+        inner_parts.append(f"mkdir -p -- {dquote(self.path.rstrip('/'))}")
 
         # Build the gsutil rsync command
         # -r for recursive sync, -m for parallel operations
@@ -519,7 +536,7 @@ class RsyncFromGSTaskBlock(TaskBlock):
             gsutil_cmd_parts.append("-c")  # Use checksum instead of mtime
         
         # Add source and destination (with potential trailing slashes)
-        gsutil_cmd_parts.extend([shquote(source_path), shquote(dest_path)])
+        gsutil_cmd_parts.extend([dquote(source_path), dquote(dest_path)])
         gsutil_cmd = " ".join(gsutil_cmd_parts)
         
         inner_parts.append(gsutil_cmd)
@@ -528,15 +545,15 @@ class RsyncFromGSTaskBlock(TaskBlock):
         inner_cmd = " && ".join(inner_parts)
         
         # Wrap entire command (including all checks) in flock
-        locked_cmd = f"flock -x {shquote(lockfile)} -c {shquote(inner_cmd)}"
+        locked_cmd = f"flock -x {dquote(lockfile)} -c {dquote(inner_cmd)}"
         
         # Add appropriate skip message based on what checks are enabled
         if self.skip_existing and self.check_exists:
-            return f"{locked_cmd} || echo 'Skipping sync (path exists or remote unavailable)'"
+            return f"{locked_cmd} || echo \"Skipping sync (path exists or remote unavailable)\""
         elif self.skip_existing:
-            return f"{locked_cmd} || echo 'Skipping sync, {self.path} already exists'"
+            return f"{locked_cmd} || echo \"Skipping sync, {self.path} already exists\""
         elif self.check_exists:
-            return f"{locked_cmd} || echo 'Skipping rsync, remote path {source_path} does not exist'"
+            return f"{locked_cmd} || echo \"Skipping rsync, remote path {source_path} does not exist\""
         else:
             return locked_cmd
 
@@ -556,8 +573,8 @@ class SetEnvTaskBlock(TaskBlock):
             # Use $(...) for command substitution
             return f"export {self.name}=$({self.value})"
         else:
-            # Use shquote to safely quote the value
-            return f"export {self.name}={shquote(self.value)}"
+            # Use dquote to allow variable expansion in the value
+            return f"export {self.name}={dquote(self.value)}"
 
 
 def _find_artifact_dependencies(value: Any) -> Iterable[Artifact]:
@@ -603,15 +620,15 @@ class Executor:
         selected = list(args.stages) if args.stages else list(self._stages.keys())
         self.execute(selected)
 
-    def execute(self, stages: List[str], head: int | None = None, tail: int | None = None, rerun: bool = False, artifacts: List[str] | None = None) -> None:
+    def execute(self, stages: List[str], head: int | None = None, tail: int | None = None, rerun: bool = False, artifacts: List[str] | None = None, jobs: int | None = None) -> None:
         """Execute the specified stages (or all stages if empty list).
         
         Args:
             stages: List of stage names to execute
             head: If provided, only execute the first N artifacts
             tail: If provided, only execute the last N artifacts
-            rerun: If True, ignore exists check and run all artifacts
-            artifacts: If provided, only execute artifacts with these class names
+            rerun: If True, ignore exists check and run all artifacts            artifacts: If provided, only execute artifacts with these class names
+            jobs: If provided, maximum number of jobs to launch in each group
         """
         # Validate inputs
         if not self._stages:
@@ -691,7 +708,7 @@ class Executor:
         
         # Compile and launch
         task_tiers = [[self.compile_artifact(a) for a in tier] for tier in executable_tiers]
-        self.launch(task_tiers, tier_to_stages=tier_to_stages)
+        self.launch(task_tiers, tier_to_stages=tier_to_stages, jobs=jobs)
 
     def _validate_and_normalize_stages(self, stages: List[str]) -> List[str]:
         """Validate stage names and return normalized list (all stages if empty)."""
@@ -1006,7 +1023,7 @@ class Executor:
 
         return tiers
 
-    def launch(self, tiers: List[List[Task]], tier_to_stages: Dict[int, List[str]] | None = None) -> None:
+    def launch(self, tiers: List[List[Task]], tier_to_stages: Dict[int, List[str]] | None = None, jobs: int | None = None) -> None:
         raise NotImplementedError
 
     def compile_artifact(self, artifact: Artifact) -> Task:
@@ -1041,7 +1058,7 @@ class PrintExecutor(Executor):
         artifact.construct(task)
         return task
 
-    def launch(self, tiers: List[List[Task]], tier_to_stages: Dict[int, List[str]] | None = None) -> None:
+    def launch(self, tiers: List[List[Task]], tier_to_stages: Dict[int, List[str]] | None = None, jobs: int | None = None) -> None:
         """Print all shell commands that would be executed."""
         # Print bash safety header for proper error handling
         print("#!/usr/bin/env bash")
@@ -1092,6 +1109,7 @@ class SlurmExecutor(Executor):
         self._dry_run_jobs: List[Dict[str, Any]] = []  # Store job info for dry run summary
         self.config_manager: Any = None  # Will be set by CLI
         self.config: Dict[str, Any] = {}
+        self.external_dependencies: List[str] = []  # External job IDs to depend on
 
     def auto_cli(self) -> None:
         """Launch the CLI interface for this executor."""
@@ -1109,7 +1127,7 @@ class SlurmExecutor(Executor):
         artifact.construct(task)
         return task
 
-    def launch(self, tiers: List[List[Task]], tier_to_stages: Dict[int, List[str]] | None = None) -> None:
+    def launch(self, tiers: List[List[Task]], tier_to_stages: Dict[int, List[str]] | None = None, jobs: int | None = None) -> None:
         """Submit each tier as one or more Slurm array jobs with proper dependencies.
         
         Args:
@@ -1123,10 +1141,14 @@ class SlurmExecutor(Executor):
         if self.dry_run:
             print("\n" + "=" * 100, file=sys.stderr)
             print("DRY RUN MODE - No jobs will be submitted", file=sys.stderr)
+            if hasattr(self, 'external_dependencies') and self.external_dependencies:
+                print(f"External dependencies: {', '.join(self.external_dependencies)}", file=sys.stderr)
             print("=" * 100 + "\n", file=sys.stderr)
         else:
             print("\n" + "=" * 80, file=sys.stderr)
             print("Launching Jobs", file=sys.stderr)
+            if hasattr(self, 'external_dependencies') and self.external_dependencies:
+                print(f"External dependencies: {', '.join(self.external_dependencies)}", file=sys.stderr)
             print("=" * 80 + "\n", file=sys.stderr)
         
         for tier_index, tier in enumerate(tiers):
@@ -1143,6 +1165,7 @@ class SlurmExecutor(Executor):
                 tier,
                 artifact_to_job_id=artifact_to_job_id,
                 stage_names=stage_names,
+                jobs=jobs,
             )
             
             # Track all submitted jobs (deduplicate since multiple artifacts can map to same job)
@@ -1165,6 +1188,7 @@ class SlurmExecutor(Executor):
         tier: List[Task],
         artifact_to_job_id: Dict[int, str],
         stage_names: List[str] | None = None,
+        jobs: int | None = None,
     ) -> Dict[int, str]:
         """Submit a tier as one or more Slurm array jobs.
         
@@ -1183,6 +1207,7 @@ class SlurmExecutor(Executor):
         """
         from datetime import datetime
         
+
         # Group tasks by their requirements
         task_groups = self._group_tasks_by_requirements(tier)
         
@@ -1201,14 +1226,20 @@ class SlurmExecutor(Executor):
             # Compute dependencies for this specific group
             dependency_job_ids = self._compute_dependencies_for_tasks(tasks, artifact_to_job_id)
             
+            # Add external dependencies if specified
+            if hasattr(self, 'external_dependencies') and self.external_dependencies:
+                dependency_job_ids = list(set(dependency_job_ids) | set(self.external_dependencies))
+                dependency_job_ids.sort()
+            
             # Generate the sbatch script
             sbatch_header = self._build_sbatch_header(
                 job_name,
                 tasks,
                 slurm_config,
                 dependency_job_ids,
+                jobs_limit=jobs,
             )
-            script_body = self._build_script_body(tasks)
+            script_body = self._build_script_body(tasks, jobs_limit=jobs)
             
             # Write script to temporary file
             script_path = self._write_script(tier_index, group_index, sbatch_header, script_body)
@@ -1370,92 +1401,109 @@ class SlurmExecutor(Executor):
         'mail_type', 'mail_user',
     }
 
+    def _get_task_requirements(self, task: Task) -> Dict[str, Any]:
+        """Extract and normalize requirements from a task's artifact.
+        
+        Returns:
+            Dictionary of requirements with validation and normalization applied.
+        """
+        if task.artifact is None or not hasattr(task.artifact, 'get_requirements'):
+            return {}
+        
+        reqs = dict(task.artifact.get_requirements())  # type: ignore[attr-defined]
+        
+        # Validate that all keys are recognized
+        invalid_keys = set(reqs.keys()) - self.VALID_REQUIREMENT_KEYS
+        if invalid_keys:
+            artifact_name = task.artifact.__class__.__name__
+            raise ValueError(
+                f"Invalid requirement key(s) in {artifact_name}.get_requirements(): {invalid_keys}. "
+                f"Valid keys are: {sorted(self.VALID_REQUIREMENT_KEYS)}"
+            )
+        
+        # Normalize: convert 'cpus' to 'cpus_per_task' for consistency
+        if 'cpus' in reqs and 'cpus_per_task' not in reqs:
+            reqs['cpus_per_task'] = reqs.pop('cpus')
+        elif 'cpus' in reqs and 'cpus_per_task' in reqs:
+            # Both specified - use cpus_per_task, ignore cpus
+            reqs.pop('cpus')
+        
+        return reqs
+    
     def _group_tasks_by_requirements(
         self,
         tier: List[Task],
-    ) -> Dict[str, List[Task]]:
+    ) -> Dict[tuple, List[Task]]:
         """Group tasks by their resource requirements.
         
         Returns:
-            Dictionary mapping requirement signature (as frozen string) to list of tasks
+            Dictionary mapping requirement tuple to list of tasks with those requirements.
         """
-        groups: Dict[str, List[Task]] = defaultdict(list)
+        groups: Dict[tuple, List[Task]] = defaultdict(list)
         
         for task in tier:
-            # Extract requirements from artifact
-            if task.artifact is not None and hasattr(task.artifact, 'get_requirements'):
-                reqs = dict(task.artifact.get_requirements())  # type: ignore[attr-defined]
-                
-                # Validate that all keys are recognized
-                invalid_keys = set(reqs.keys()) - self.VALID_REQUIREMENT_KEYS
-                if invalid_keys:
-                    artifact_name = task.artifact.__class__.__name__
-                    raise ValueError(
-                        f"Invalid requirement key(s) in {artifact_name}.get_requirements(): {invalid_keys}. "
-                        f"Valid keys are: {sorted(self.VALID_REQUIREMENT_KEYS)}"
-                    )
-            else:
-                reqs = {}
-            
-            # Create a hashable signature from requirements
-            # Sort keys for consistency
-            req_signature = str(sorted(reqs.items()))
-            groups[req_signature].append(task)
+            reqs = self._get_task_requirements(task)
+            # Create a hashable key from sorted requirements
+            # Use frozenset of items for proper hashing
+            req_key = tuple(sorted(reqs.items()))
+            groups[req_key].append(task)
         
         return groups
 
-    def _build_slurm_config(self, requirements_signature: str) -> Dict[str, Any]:
-        """Build Slurm configuration from a requirements signature.
+    def _build_slurm_config(self, requirements_tuple: tuple) -> Dict[str, Any]:
+        """Build Slurm configuration from normalized requirements.
         
         Args:
-            requirements_signature: String representation of sorted requirements dict
+            requirements_tuple: Tuple of (key, value) pairs from task requirements
         
         Returns:
             Complete Slurm configuration with defaults applied
         """
-        # Parse requirements from signature
-        # The signature is str(sorted(reqs.items()))
-        try:
-            reqs = dict(eval(requirements_signature)) if requirements_signature != "[]" else {}
-        except Exception:
-            reqs = {}
+        # Convert tuple back to dict
+        reqs = dict(requirements_tuple)
         
         # Start with global defaults
         config: Dict[str, Any] = {}
         config.update(self.default_slurm_args)
         
-        # Get default partition from config or use 'general' as fallback
+        # Get default partition
         default_partition = self.config.get('default_partition', 'general')
         
-        # Apply partition-specific defaults from config
+        # Determine which partition to use for partition-specific defaults
         partition = reqs.get('partition', config.get('partition', default_partition))
+        
+        # Apply partition-specific defaults if available
         if partition in self.default_slurm_args_by_partition:
             config.update(self.default_slurm_args_by_partition[partition])
         
         # Apply artifact-specific requirements (highest priority)
         config.update(reqs)
         
-        # Apply reasonable defaults
+        # Apply final defaults only if not set
         config.setdefault('partition', default_partition)
-        config.setdefault('time', '2-00:00:00')  # 2 days default
+        config.setdefault('time', '2-00:00:00')
         
-        # Set default cpus to match number of GPUs
-        if 'cpus' not in config and 'gpus' in config:
-            # Extract GPU count from gpus value
+        # Set default cpus_per_task based on GPUs if not specified
+        if 'cpus_per_task' not in config and 'gpus' in config:
+            # Try to extract GPU count
             gpus_val = str(config['gpus'])
             if ':' in gpus_val:
-                # Format like "A6000:4" - extract the number after colon
-                gpu_count = int(gpus_val.split(':')[-1])
-            else:
-                # Just a number
+                # Format like "A6000:4" - extract number after colon
                 try:
-                    gpu_count = int(gpus_val)
+                    gpu_count = int(gpus_val.split(':')[-1])
+                    config['cpus_per_task'] = gpu_count
                 except ValueError:
-                    # Single GPU model name like "A6000"
-                    gpu_count = 1
-            config.setdefault('cpus', gpu_count)
-        else:
-            config.setdefault('cpus', 1)
+                    config['cpus_per_task'] = 1
+            else:
+                # Try to parse as integer
+                try:
+                    config['cpus_per_task'] = int(gpus_val)
+                except ValueError:
+                    # Single GPU name like "A6000"
+                    config['cpus_per_task'] = 1
+        
+        # Final fallback for cpus_per_task
+        config.setdefault('cpus_per_task', 1)
         
         return config
 
@@ -1465,6 +1513,7 @@ class SlurmExecutor(Executor):
         tasks: List[Task],
         config: Dict[str, Any],
         dependency_job_ids: List[str],
+        jobs_limit: int | None = None,
     ) -> List[str]:
         """Build the #SBATCH header lines for the script.
         
@@ -1473,6 +1522,7 @@ class SlurmExecutor(Executor):
             tasks: List of tasks in this job
             config: Slurm configuration dictionary
             dependency_job_ids: Job IDs that must complete before this job starts
+            jobs_limit: If specified, combine tasks to create this many array indices
         """
         lines = ["#!/usr/bin/env bash"]
         
@@ -1502,8 +1552,13 @@ class SlurmExecutor(Executor):
             lines.append(f"#SBATCH --chdir={config['chdir']}")
         
         # Dependencies: wait for all previous tier jobs to complete successfully
-        if dependency_job_ids:
-            dependency_str = ":".join(dependency_job_ids)
+        # Also include any external dependencies specified via CLI
+        all_dependencies = list(dependency_job_ids)
+        if hasattr(self, 'external_dependencies') and self.external_dependencies:
+            all_dependencies.extend(self.external_dependencies)
+        
+        if all_dependencies:
+            dependency_str = ":".join(all_dependencies)
             lines.append(f"#SBATCH --dependency=afterok:{dependency_str}")
         
         # Basic resource specifications
@@ -1521,9 +1576,8 @@ class SlurmExecutor(Executor):
             lines.append(f"#SBATCH --nodes={config['nodes']}")
         if 'ntasks' in config:
             lines.append(f"#SBATCH --ntasks={config['ntasks']}")
-        if 'cpus' in config or 'cpus_per_task' in config:
-            cpus = config.get('cpus') or config.get('cpus_per_task')
-            lines.append(f"#SBATCH --cpus-per-task={cpus}")
+        if 'cpus_per_task' in config:
+            lines.append(f"#SBATCH --cpus-per-task={config['cpus_per_task']}")
         
         # Memory specifications
         if 'mem' in config:
@@ -1558,13 +1612,22 @@ class SlurmExecutor(Executor):
             lines.append(f"#SBATCH --mail-user={config['mail_user']}")
         
         # Array specification
-        max_index = len(tasks) - 1
+        # If jobs_limit is specified and less than number of tasks, use it
+        if jobs_limit is not None and jobs_limit > 0 and jobs_limit < len(tasks):
+            max_index = jobs_limit - 1
+        else:
+            max_index = len(tasks) - 1
         lines.append(f"#SBATCH --array=0-{max_index}")
         
         return lines
 
-    def _build_script_body(self, tier: List[Task]) -> List[str]:
-        """Build the shell script body with case statement for array tasks."""
+    def _build_script_body(self, tier: List[Task], jobs_limit: int | None = None) -> List[str]:
+        """Build the shell script body with case statement for array tasks.
+        
+        Args:
+            tier: List of tasks to execute
+            jobs_limit: If specified, combine tasks to create this many array indices
+        """
         lines = [
             "set -euo pipefail",
         ]
@@ -1577,17 +1640,40 @@ class SlurmExecutor(Executor):
         
         lines.append("case \"${SLURM_ARRAY_TASK_ID:-0}\" in")
         
-        # Add a case for each task
-        for idx, task in enumerate(tier):
-            lines.append(f"  {idx})")
-            for block in task.blocks:
-                command = block.execute()
-                if command:
-                    # Print the command before executing it (escape single quotes for the echo)
-                    escaped_command = command.replace("'", "'\\''")
-                    lines.append(f"    echo '+ {escaped_command}' >&2")
-                    lines.append(f"    {command}")
-            lines.append("    ;;")
+        # Redistribute tasks if jobs_limit is specified
+        if jobs_limit is not None and jobs_limit > 0 and jobs_limit < len(tier):
+            # Create jobs_limit groups, distribute tasks round-robin
+            task_groups: List[List[Task]] = [[] for _ in range(jobs_limit)]
+            for idx, task in enumerate(tier):
+                group_idx = idx % jobs_limit
+                task_groups[group_idx].append(task)
+            
+            # Generate a case for each group
+            for group_idx, tasks in enumerate(task_groups):
+                if not tasks:
+                    continue
+                lines.append(f"  {group_idx})")
+                for task in tasks:
+                    for block in task.blocks:
+                        command = block.execute()
+                        if command:
+                            # Print the command before executing it (escape for double quotes)
+                            escaped_command = command.replace('\\', '\\\\').replace('"', '\\"').replace('`', '\\`')
+                            lines.append(f'    echo "+ {escaped_command}" >&2')
+                            lines.append(f"    {command}")
+                lines.append("    ;;")
+        else:
+            # Original behavior: one case per task
+            for idx, task in enumerate(tier):
+                lines.append(f"  {idx})")
+                for block in task.blocks:
+                    command = block.execute()
+                    if command:
+                        # Print the command before executing it (escape for double quotes)
+                        escaped_command = command.replace('\\', '\\\\').replace('"', '\\"').replace('`', '\\`')
+                        lines.append(f'    echo "+ {escaped_command}" >&2')
+                        lines.append(f"    {command}")
+                lines.append("    ;;")
         
         # Add error handler for invalid IDs
         lines.extend([

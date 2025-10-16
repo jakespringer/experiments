@@ -213,6 +213,18 @@ class ExperimentCLI:
             metavar='ARTIFACT',
             help='Artifact class names to include (filters by type)'
         )
+        launch_parser.add_argument(
+            '--jobs',
+            type=int,
+            metavar='N',
+            help='Combine tasks into N parallel jobs by running multiple tasks sequentially in each job'
+        )
+        launch_parser.add_argument(
+            '--dependency',
+            nargs='+',
+            metavar='JOBID',
+            help='Job IDs that all launched jobs should depend on'
+        )
         
         # drylaunch command
         drylaunch_parser = subparsers.add_parser('drylaunch', help='Dry run: show what would be launched')
@@ -254,6 +266,18 @@ class ExperimentCLI:
             nargs='+',
             metavar='ARTIFACT',
             help='Artifact class names to include (filters by type)'
+        )
+        drylaunch_parser.add_argument(
+            '--jobs',
+            type=int,
+            metavar='N',
+            help='Combine tasks into N parallel jobs by running multiple tasks sequentially in each job'
+        )
+        drylaunch_parser.add_argument(
+            '--dependency',
+            nargs='+',
+            metavar='JOBID',
+            help='Job IDs that all launched jobs should depend on'
         )
         
         # cancel command
@@ -313,6 +337,12 @@ class ExperimentCLI:
             metavar='ARTIFACT',
             help='Artifact class names to include (filters by type)'
         )
+        print_parser.add_argument(
+            '--jobs',
+            type=int,
+            metavar='N',
+            help='Combine tasks into N parallel jobs by running multiple tasks sequentially in each job'
+        )
         
         args = parser.parse_args()
         
@@ -322,9 +352,9 @@ class ExperimentCLI:
         
         # Route to appropriate handler
         if args.command == 'launch':
-            self.launch(args.stages, dry_run=False, head=getattr(args, 'head', None), tail=getattr(args, 'tail', None), rerun=getattr(args, 'rerun', False), reverse=getattr(args, 'reverse', False), exclude=getattr(args, 'exclude', None), artifacts=getattr(args, 'artifact', None))
+            self.launch(args.stages, dry_run=False, head=getattr(args, 'head', None), tail=getattr(args, 'tail', None), rerun=getattr(args, 'rerun', False), reverse=getattr(args, 'reverse', False), exclude=getattr(args, 'exclude', None), artifacts=getattr(args, 'artifact', None), jobs=getattr(args, 'jobs', None), dependency=getattr(args, 'dependency', None))
         elif args.command == 'drylaunch':
-            self.launch(args.stages, dry_run=True, head=getattr(args, 'head', None), tail=getattr(args, 'tail', None), rerun=getattr(args, 'rerun', False), reverse=getattr(args, 'reverse', False), exclude=getattr(args, 'exclude', None), artifacts=getattr(args, 'artifact', None))
+            self.launch(args.stages, dry_run=True, head=getattr(args, 'head', None), tail=getattr(args, 'tail', None), rerun=getattr(args, 'rerun', False), reverse=getattr(args, 'reverse', False), exclude=getattr(args, 'exclude', None), artifacts=getattr(args, 'artifact', None), jobs=getattr(args, 'jobs', None), dependency=getattr(args, 'dependency', None))
         elif args.command == 'cancel':
             self.cancel(args.stages)
         elif args.command == 'cat':
@@ -332,9 +362,9 @@ class ExperimentCLI:
         elif args.command == 'history':
             self.history()
         elif args.command == 'print':
-            self.print_commands(args.stages, head=getattr(args, 'head', None), tail=getattr(args, 'tail', None), rerun=getattr(args, 'rerun', False), reverse=getattr(args, 'reverse', False), exclude=getattr(args, 'exclude', None), artifacts=getattr(args, 'artifact', None))
+            self.print_commands(args.stages, head=getattr(args, 'head', None), tail=getattr(args, 'tail', None), rerun=getattr(args, 'rerun', False), reverse=getattr(args, 'reverse', False), exclude=getattr(args, 'exclude', None), artifacts=getattr(args, 'artifact', None), jobs=getattr(args, 'jobs', None))
     
-    def launch(self, stages: List[str], dry_run: bool = False, head: Optional[int] = None, tail: Optional[int] = None, rerun: bool = False, reverse: bool = False, exclude: Optional[List[str]] = None, artifacts: Optional[List[str]] = None) -> None:
+    def launch(self, stages: List[str], dry_run: bool = False, head: Optional[int] = None, tail: Optional[int] = None, rerun: bool = False, reverse: bool = False, exclude: Optional[List[str]] = None, artifacts: Optional[List[str]] = None, jobs: Optional[int] = None, dependency: Optional[List[str]] = None) -> None:
         """Launch experiment stages."""
         # Apply config settings to executor
         self.executor.dry_run = dry_run
@@ -345,6 +375,10 @@ class ExperimentCLI:
         if 'default_slurm_args' in self.config:
             self.executor.default_slurm_args_by_partition = self.config['default_slurm_args']
         
+        # Set external dependencies on the executor
+        if hasattr(self.executor, 'external_dependencies'):
+            self.executor.external_dependencies = dependency or []
+        
         # Execute stages
         selected = stages if stages else list(self.executor._stages.keys())
         
@@ -354,7 +388,7 @@ class ExperimentCLI:
         
         if reverse:
             selected = list(reversed(selected))
-        self.executor.execute(selected, head=head, tail=tail, rerun=rerun, artifacts=artifacts)
+        self.executor.execute(selected, head=head, tail=tail, rerun=rerun, artifacts=artifacts, jobs=jobs)
     
     def cancel(self, stages: List[str]) -> None:
         """Cancel jobs for the specified stages."""
@@ -539,7 +573,7 @@ class ExperimentCLI:
         print(f"Use 'cat <job_id>' or 'cat <job_id>_<array_index>' to view logs")
         print("=" * 100)
     
-    def print_commands(self, stages: List[str], head: Optional[int] = None, tail: Optional[int] = None, rerun: bool = False, reverse: bool = False, exclude: Optional[List[str]] = None, artifacts: Optional[List[str]] = None) -> None:
+    def print_commands(self, stages: List[str], head: Optional[int] = None, tail: Optional[int] = None, rerun: bool = False, reverse: bool = False, exclude: Optional[List[str]] = None, artifacts: Optional[List[str]] = None, jobs: Optional[int] = None) -> None:
         """Print commands to run sequentially (can be piped to bash)."""
         from .executor import PrintExecutor
         
@@ -563,7 +597,7 @@ class ExperimentCLI:
         
         if reverse:
             selected = list(reversed(selected))
-        print_executor.execute(selected, head=head, tail=tail, rerun=rerun, artifacts=artifacts)
+        print_executor.execute(selected, head=head, tail=tail, rerun=rerun, artifacts=artifacts, jobs=jobs)
 
 
 def auto_cli(executor: SlurmExecutor) -> None:

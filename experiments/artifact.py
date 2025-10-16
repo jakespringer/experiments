@@ -83,7 +83,6 @@ class Artifact:
         payload = '|'.join(f"{k}={v}" for k, v in items)
         return hashlib.sha256(payload.encode('utf-8')).hexdigest()[:10]
 
-
 class ArtifactSet(Sequence[Any]):
     """A collection wrapper with simple functional utilities.
 
