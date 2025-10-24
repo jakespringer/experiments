@@ -10,149 +10,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .executor import SlurmExecutor
+from .config import ConfigManager
+from .project import Project
 
 
-class ConfigManager:
-    """Manages experiment configuration and state."""
-    
-    def __init__(self):
-        self.config_dir = Path.home() / ".experiments"
-        self.config_file = self.config_dir / "config.json"
-        self.projects_dir = self.config_dir / "projects"
-    
-    def ensure_config(self) -> Dict[str, Any]:
-        """Ensure config directory and file exist, return config."""
-        self.config_dir.mkdir(parents=True, exist_ok=True)
-        self.projects_dir.mkdir(parents=True, exist_ok=True)
-        
-        if not self.config_file.exists():
-            # Create default config
-            default_config = {
-                "log_directory": str(self.config_dir / "logs"),
-                "default_partition": "general",
-                "default_slurm_args": {
-                    "general": {
-                        "time": "2-00:00:00",
-                        "cpus": 1,
-                        "requeue": False
-                    },
-                    "array": {
-                        "time": "2-00:00:00",
-                        "cpus": 4,
-                        "requeue": True
-                    },
-                    "cpu": {
-                        "time": "1-00:00:00",
-                        "cpus": 1,
-                        "requeue": False
-                    }
-                }
-            }
-            self.save_config(default_config)
-            
-            # Create log directory
-            Path(default_config["log_directory"]).mkdir(parents=True, exist_ok=True)
-            
-            return default_config
-        
-        # Load existing config
-        config = self.load_config()
-        
-        # Migrate: add default_partition if it doesn't exist
-        if "default_partition" not in config:
-            config["default_partition"] = "general"
-            self.save_config(config)
-        
-        return config
-    
-    def load_config(self) -> Dict[str, Any]:
-        """Load configuration from file."""
-        with open(self.config_file, 'r') as f:
-            return json.load(f)
-    
-    def save_config(self, config: Dict[str, Any]) -> None:
-        """Save configuration to file."""
-        with open(self.config_file, 'w') as f:
-            json.dump(config, f, indent=2)
-    
-    def get_project_dir(self, project: str) -> Path:
-        """Get project directory, creating it if needed."""
-        project_dir = self.projects_dir / project
-        project_dir.mkdir(parents=True, exist_ok=True)
-        return project_dir
-    
-    def get_stage_dir(self, project: str, stage: str) -> Path:
-        """Get stage directory, creating it if needed."""
-        stage_dir = self.get_project_dir(project) / stage
-        stage_dir.mkdir(parents=True, exist_ok=True)
-        return stage_dir
-    
-    def save_job_info(self, project: str, stage: str, job_info: Dict[str, Any]) -> None:
-        """Save job information for a stage."""
-        stage_dir = self.get_stage_dir(project, stage)
-        jobs_file = stage_dir / "jobs.json"
-        
-        # Load existing jobs
-        jobs = []
-        if jobs_file.exists():
-            with open(jobs_file, 'r') as f:
-                jobs = json.load(f)
-        
-        # Add new job info
-        jobs.append(job_info)
-        
-        # Save
-        with open(jobs_file, 'w') as f:
-            json.dump(jobs, f, indent=2)
-    
-    def load_jobs(self, project: str, stage: Optional[str] = None) -> List[Dict[str, Any]]:
-        """Load job information for a stage or all stages."""
-        jobs = []
-        
-        if stage:
-            # Load jobs for specific stage
-            stage_dir = self.get_stage_dir(project, stage)
-            jobs_file = stage_dir / "jobs.json"
-            if jobs_file.exists():
-                with open(jobs_file, 'r') as f:
-                    stage_jobs = json.load(f)
-                    for job in stage_jobs:
-                        job['stage'] = stage
-                    jobs.extend(stage_jobs)
-        else:
-            # Load jobs for all stages
-            project_dir = self.get_project_dir(project)
-            for stage_dir in project_dir.iterdir():
-                if stage_dir.is_dir():
-                    jobs_file = stage_dir / "jobs.json"
-                    if jobs_file.exists():
-                        with open(jobs_file, 'r') as f:
-                            stage_jobs = json.load(f)
-                            for job in stage_jobs:
-                                job['stage'] = stage_dir.name
-                            jobs.extend(stage_jobs)
-        
-        return jobs
-    
-    def get_canceled_jobs_file(self, project: str) -> Path:
-        """Get the path to the canceled jobs tracking file."""
-        return self.get_project_dir(project) / "canceled_jobs.json"
-    
-    def load_canceled_jobs(self, project: str) -> set:
-        """Load the set of canceled job IDs."""
-        canceled_file = self.get_canceled_jobs_file(project)
-        if canceled_file.exists():
-            with open(canceled_file, 'r') as f:
-                return set(json.load(f))
-        return set()
-    
-    def save_canceled_job(self, project: str, job_id: str) -> None:
-        """Mark a job as canceled."""
-        canceled_jobs = self.load_canceled_jobs(project)
-        canceled_jobs.add(job_id)
-        canceled_file = self.get_canceled_jobs_file(project)
-        with open(canceled_file, 'w') as f:
-            json.dump(sorted(canceled_jobs), f, indent=2)
 
 
 class ExperimentCLI:
@@ -162,6 +23,9 @@ class ExperimentCLI:
         self.executor = executor
         self.config_manager = ConfigManager()
         self.config = self.config_manager.ensure_config()
+        # Ensure Project context is initialized
+        if Project.name is None and getattr(self.executor, 'project', None):
+            Project.init(self.executor.project)  # type: ignore[arg-type]
     
     def run(self) -> None:
         """Parse arguments and run the appropriate command."""
@@ -225,6 +89,17 @@ class ExperimentCLI:
             metavar='JOBID',
             help='Job IDs that all launched jobs should depend on'
         )
+        launch_parser.add_argument(
+            '--slurm',
+            nargs='*',
+            metavar='KEY=VALUE',
+            help='Override Slurm args for all jobs (e.g., time=12:00:00 gpus=4)'
+        )
+        launch_parser.add_argument(
+            '--force-launch',
+            action='store_true',
+            help='Ignore running check and launch jobs anyway'
+        )
         
         # drylaunch command
         drylaunch_parser = subparsers.add_parser('drylaunch', help='Dry run: show what would be launched')
@@ -278,6 +153,12 @@ class ExperimentCLI:
             nargs='+',
             metavar='JOBID',
             help='Job IDs that all launched jobs should depend on'
+        )
+        drylaunch_parser.add_argument(
+            '--slurm',
+            nargs='*',
+            metavar='KEY=VALUE',
+            help='Override Slurm args for all jobs (no submission)'
         )
         
         # cancel command
@@ -352,9 +233,35 @@ class ExperimentCLI:
         
         # Route to appropriate handler
         if args.command == 'launch':
-            self.launch(args.stages, dry_run=False, head=getattr(args, 'head', None), tail=getattr(args, 'tail', None), rerun=getattr(args, 'rerun', False), reverse=getattr(args, 'reverse', False), exclude=getattr(args, 'exclude', None), artifacts=getattr(args, 'artifact', None), jobs=getattr(args, 'jobs', None), dependency=getattr(args, 'dependency', None))
+            self.launch(
+                args.stages,
+                dry_run=False,
+                head=getattr(args, 'head', None),
+                tail=getattr(args, 'tail', None),
+                rerun=getattr(args, 'rerun', False),
+                reverse=getattr(args, 'reverse', False),
+                exclude=getattr(args, 'exclude', None),
+                artifacts=getattr(args, 'artifact', None),
+                jobs=getattr(args, 'jobs', None),
+                dependency=getattr(args, 'dependency', None),
+                slurm_overrides=getattr(args, 'slurm', None),
+                force_launch=getattr(args, 'force_launch', False),
+            )
         elif args.command == 'drylaunch':
-            self.launch(args.stages, dry_run=True, head=getattr(args, 'head', None), tail=getattr(args, 'tail', None), rerun=getattr(args, 'rerun', False), reverse=getattr(args, 'reverse', False), exclude=getattr(args, 'exclude', None), artifacts=getattr(args, 'artifact', None), jobs=getattr(args, 'jobs', None), dependency=getattr(args, 'dependency', None))
+            self.launch(
+                args.stages,
+                dry_run=True,
+                head=getattr(args, 'head', None),
+                tail=getattr(args, 'tail', None),
+                rerun=getattr(args, 'rerun', False),
+                reverse=getattr(args, 'reverse', False),
+                exclude=getattr(args, 'exclude', None),
+                artifacts=getattr(args, 'artifact', None),
+                jobs=getattr(args, 'jobs', None),
+                dependency=getattr(args, 'dependency', None),
+                slurm_overrides=getattr(args, 'slurm', None),
+                force_launch=False,
+            )
         elif args.command == 'cancel':
             self.cancel(args.stages)
         elif args.command == 'cat':
@@ -364,16 +271,21 @@ class ExperimentCLI:
         elif args.command == 'print':
             self.print_commands(args.stages, head=getattr(args, 'head', None), tail=getattr(args, 'tail', None), rerun=getattr(args, 'rerun', False), reverse=getattr(args, 'reverse', False), exclude=getattr(args, 'exclude', None), artifacts=getattr(args, 'artifact', None), jobs=getattr(args, 'jobs', None))
     
-    def launch(self, stages: List[str], dry_run: bool = False, head: Optional[int] = None, tail: Optional[int] = None, rerun: bool = False, reverse: bool = False, exclude: Optional[List[str]] = None, artifacts: Optional[List[str]] = None, jobs: Optional[int] = None, dependency: Optional[List[str]] = None) -> None:
+    def launch(self, stages: List[str], dry_run: bool = False, head: Optional[int] = None, tail: Optional[int] = None, rerun: bool = False, reverse: bool = False, exclude: Optional[List[str]] = None, artifacts: Optional[List[str]] = None, jobs: Optional[int] = None, dependency: Optional[List[str]] = None, slurm_overrides: Optional[List[str]] = None, force_launch: bool = False) -> None:
         """Launch experiment stages."""
         # Apply config settings to executor
         self.executor.dry_run = dry_run
-        self.executor.config_manager = self.config_manager
-        self.executor.config = self.config
-        
-        # Get default slurm args for partitions from config
-        if 'default_slurm_args' in self.config:
-            self.executor.default_slurm_args_by_partition = self.config['default_slurm_args']
+        # Apply CLI slurm overrides (highest priority)
+        overrides: Dict[str, Any] = {}
+        if slurm_overrides:
+            for item in slurm_overrides:
+                if '=' in item:
+                    k, v = item.split('=', 1)
+                    overrides[k.strip()] = v.strip()
+        if hasattr(self.executor, 'cli_slurm_overrides'):
+            self.executor.cli_slurm_overrides = overrides
+        if hasattr(self.executor, 'force_launch'):
+            self.executor.force_launch = bool(force_launch)
         
         # Set external dependencies on the executor
         if hasattr(self.executor, 'external_dependencies'):
@@ -392,7 +304,7 @@ class ExperimentCLI:
     
     def cancel(self, stages: List[str]) -> None:
         """Cancel jobs for the specified stages."""
-        if not self.executor.project:
+        if not Project.name:
             print("Error: No project specified in executor")
             sys.exit(1)
         
@@ -405,7 +317,7 @@ class ExperimentCLI:
         # Load jobs for each stage
         all_jobs_to_cancel = []
         for stage in stages_to_cancel:
-            jobs = self.config_manager.load_jobs(self.executor.project, stage)
+            jobs = self.config_manager.load_jobs(Project.name, stage)  # type: ignore[arg-type]
             all_jobs_to_cancel.extend(jobs)
         
         if not all_jobs_to_cancel:
@@ -413,7 +325,7 @@ class ExperimentCLI:
             return
         
         # Load already canceled jobs
-        canceled_jobs = self.config_manager.load_canceled_jobs(self.executor.project)
+        canceled_jobs = self.config_manager.load_canceled_jobs(Project.name)  # type: ignore[arg-type]
         
         # Group by job_id (since array jobs share one ID)
         job_ids = set()
@@ -438,7 +350,7 @@ class ExperimentCLI:
                 print(f"Cancelled job {job_id}")
                 successfully_canceled.append(job_id)
                 # Mark as canceled
-                self.config_manager.save_canceled_job(self.executor.project, job_id)
+                self.config_manager.save_canceled_job(Project.name, job_id)  # type: ignore[arg-type]
             except subprocess.CalledProcessError as e:
                 error_msg = e.stderr.decode().strip()
                 print(f"Failed to cancel job {job_id}: {error_msg}")
@@ -508,7 +420,7 @@ class ExperimentCLI:
     
     def history(self) -> None:
         """Print launch history."""
-        if not self.executor.project:
+        if not Project.name:
             print("Error: No project specified in executor")
             sys.exit(1)
         
@@ -516,25 +428,27 @@ class ExperimentCLI:
         all_jobs = []
         seen_job_ids = set()
         
-        project_dir = self.config_manager.get_project_dir(self.executor.project)
+        project_dir = self.config_manager.get_project_dir(Project.name)  # type: ignore[arg-type]
         if not project_dir.exists():
             print("No jobs found in history.")
             return
         
-        for stage_dir in sorted(project_dir.iterdir()):
-            if stage_dir.is_dir():
-                jobs_file = stage_dir / "jobs.json"
-                if jobs_file.exists():
-                    with open(jobs_file, 'r') as f:
-                        import json
-                        stage_jobs = json.load(f)
-                        for job in stage_jobs:
-                            job_id = job.get('job_id')
-                            # Only add unique jobs (avoid duplicates)
-                            if job_id and job_id not in seen_job_ids:
-                                seen_job_ids.add(job_id)
-                                job['stage'] = stage_dir.name
-                                all_jobs.append(job)
+        stages_root = project_dir / "stages"
+        if stages_root.exists():
+            for stage_dir in sorted(stages_root.iterdir()):
+                if stage_dir.is_dir():
+                    jobs_file = stage_dir / "jobs.json"
+                    if jobs_file.exists():
+                        with open(jobs_file, 'r') as f:
+                            import json
+                            stage_jobs = json.load(f)
+                            for job in stage_jobs:
+                                job_id = job.get('job_id')
+                                # Only add unique jobs (avoid duplicates)
+                                if job_id and job_id not in seen_job_ids:
+                                    seen_job_ids.add(job_id)
+                                    job['stage'] = stage_dir.name
+                                    all_jobs.append(job)
         
         if not all_jobs:
             print("No jobs found in history.")
@@ -544,7 +458,7 @@ class ExperimentCLI:
         all_jobs.sort(key=lambda j: j.get('timestamp', ''))
         
         print("=" * 100)
-        print(f"Job History for Project: {self.executor.project}")
+        print(f"Job History for Project: {Project.name}")
         print("=" * 100)
         print()
         print(f"Total jobs: {len(all_jobs)}")
@@ -579,8 +493,6 @@ class ExperimentCLI:
         
         # Create a PrintExecutor with the same paths as the SlurmExecutor
         print_executor = PrintExecutor(
-            artifact_path=str(self.executor.artifact_path),
-            code_path=str(self.executor.code_path),
             gs_path=self.executor.gs_path,
             setup_command=self.executor.setup_command,
         )

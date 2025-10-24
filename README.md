@@ -76,10 +76,10 @@ if __name__ == '__main__':
 
 ```bash
 # Preview what will run
-python my_experiment.py drylaunch
+python my_experiment.py drylaunch --slurm time=12:00:00 partition=gpu
 
 # Launch all jobs
-python my_experiment.py launch
+python my_experiment.py launch --slurm time=2-00:00:00 gpus=4 cpus=8
 
 # Check status and history
 python my_experiment.py history
@@ -213,6 +213,10 @@ Customize defaults per partition. Artifact-specific requirements override these.
 - `--reverse` - Launch stages in reverse order (respects dependencies)
 - `--exclude STAGE [STAGE...]` - Exclude specific stages
 - `--artifact CLASS [CLASS...]` - Only run artifacts of specific types
+- `--slurm KEY=VALUE [KEY=VALUE...]` - Override Slurm args for all jobs
+  - Works with any supported Slurm option, e.g. `time`, `partition`, `gpus`, `cpus`, `mem`, `qos`, `account`, `output`, `error`, etc.
+  - Example: `--slurm time=12:00:00 partition=gpu gpus=A100:4 mem=64G`
+- `--force-launch` (launch only) - Launch even if an artifact is already running
 
 **Examples:**
 ```bash
@@ -227,6 +231,12 @@ python script.py launch --artifact FinetunedModel
 
 # Force rerun even if artifacts exist
 python script.py launch --rerun
+
+# Override Slurm resources for this run
+python script.py launch --slurm time=8:00:00 partition=gpu gpus=4 cpus=8
+
+# Launch even if previously submitted tasks are still running
+python script.py launch --force-launch
 ```
 
 ## Advanced Usage
@@ -610,6 +620,16 @@ python script.py cat <job_id>_<array_index>
 # Cancel if needed
 python script.py cancel
 ```
+
+### Duplicate-Run Prevention
+
+The launcher tracks each submitted artifact by its unique `relpath` and the Slurm job it was submitted to.
+
+- Before submitting, it checks `squeue` for running jobs and skips artifacts that already have a running instance.
+- Tracking is stored in `~/.experiments/launched_jobs.json`.
+- Use `--force-launch` to skip this check and always submit new jobs.
+
+Note: When tasks are submitted as array jobs, the tracker records both the `job_id` and the array `index` for each artifact.
 
 ## Tips
 

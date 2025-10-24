@@ -182,6 +182,25 @@ class ArtifactSet(Sequence[Any]):
                 mapped.append(fn(item))
         return ArtifactSet(mapped)
 
+    def filter(self, predicate: Callable[..., bool]) -> "ArtifactSet":
+        """Filter items by a predicate.
+
+        - If an item is a tuple, it will be splatted into the predicate.
+        - Otherwise, the item is passed as a single argument.
+
+        Returns a new ArtifactSet containing only items for which the
+        predicate returns True.
+        """
+        filtered: List[Any] = []
+        for item in self._items:
+            if isinstance(item, tuple):
+                if predicate(*item):
+                    filtered.append(item)
+            else:
+                if predicate(item):
+                    filtered.append(item)
+        return ArtifactSet(filtered)
+
     def map_flatten(self, fn: Callable[..., "ArtifactSet"]) -> "ArtifactSet":
         """Map a function across items and flatten the results.
 

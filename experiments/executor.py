@@ -16,6 +16,59 @@ from pathlib import Path
 from shlex import quote as shquote
 
 from .artifact import Artifact, ArtifactSet
+from .config import ConfigManager
+from .project import Project
+
+# Optional pretty progress bar (stderr). Falls back gracefully if unavailable.
+try:
+    from tqdm import tqdm as _tqdm  # type: ignore
+except Exception:  # pragma: no cover
+    _tqdm = None
+
+
+class _Progress:
+    """Minimal progress helper that writes to stderr (pretty with tqdm if available)."""
+
+    def __init__(self, total: int, desc: str) -> None:
+        self._total = max(0, int(total))
+        self._count = 0
+        self._desc = desc
+        if _tqdm is not None and self._total > 0:
+            self._bar = _tqdm(
+                total=self._total,
+                desc=desc,
+                file=sys.stderr,
+                bar_format="{l_bar}{bar} | {n_fmt}/{total_fmt} steps",
+                leave=False,
+            )
+        else:
+            self._bar = None
+            self._render()
+
+    def set(self, desc: str) -> None:
+        self._desc = desc
+        if self._bar is not None:
+            self._bar.set_description(desc)
+        else:
+            self._render()
+
+    def advance(self, n: int = 1) -> None:
+        if self._bar is not None:
+            self._bar.update(n)
+        else:
+            self._count = min(self._total, self._count + n)
+            self._render()
+
+    def close(self) -> None:
+        if self._bar is not None:
+            self._bar.close()
+        else:
+            sys.stderr.write("\n")
+            sys.stderr.flush()
+
+    def _render(self) -> None:
+        sys.stderr.write(f"\r{self._desc} [{self._count}/{self._total}]")
+        sys.stderr.flush()
 
 
 def dquote(s: str) -> str:
@@ -85,6 +138,14 @@ class Task:
         yaml_content = yaml.dump(content, default_flow_style=False, sort_keys=False)
         self.blocks.append(CreateFileTaskBlock(path, yaml_content))
     
+    def create_json_file(self, path: str, content: Dict[str, Any]) -> None:
+        """Add a JSON file creation block to this task.
+        
+        The content dictionary will be serialized to JSON format.
+        """
+        json_content = json.dumps(content, indent=2, sort_keys=False)
+        self.blocks.append(CreateFileTaskBlock(path, json_content))
+    
     def run_command(
         self,
         command: str,
@@ -92,17 +153,18 @@ class Task:
         kwargs: Dict[str, Any] | None = None,
         vformat: str | None = None,
         kwformat: str | None = None,
+        flagformat: str | None = None,
     ) -> None:
         """Add a command execution block to this task."""
-        self.blocks.append(CommandTaskBlock(command, vargs, kwargs, vformat, kwformat))
+        self.blocks.append(CommandTaskBlock(command, vargs, kwargs, vformat, kwformat, flagformat))
 
-    def upload_to_gs(self, path: str, gs_path: str, directory: bool = False) -> None:
+    def upload_to_gs(self, path: str, gs_path: str, directory: bool = False, contents: bool | None = True) -> None:
         """Add a Google Cloud Storage upload block to this task."""
-        self.blocks.append(UploadToGSTaskBlock(path, gs_path, directory=directory))
+        self.blocks.append(UploadToGSTaskBlock(path, gs_path, directory=directory, contents=contents))
 
-    def download_from_gs(self, gs_path: str, path: str, directory: bool = False, skip_existing: bool = True) -> None:
+    def download_from_gs(self, gs_path: str, path: str, directory: bool = False, skip_existing: bool = True, contents: bool | None = True) -> None:
         """Add a Google Cloud Storage download block to this task."""
-        self.blocks.append(DownloadFromGSTaskBlock(gs_path, path, directory=directory, skip_existing=skip_existing))
+        self.blocks.append(DownloadFromGSTaskBlock(gs_path, path, directory=directory, skip_existing=skip_existing, contents=contents))
 
     def download(self, url: str, local_path: str, skip_existing: bool = True) -> None:
         """Add a web URL download block to this task."""
@@ -116,11 +178,11 @@ class Task:
         """Add a Hugging Face model download block to this task."""
         self.blocks.append(DownloadHFModelTaskBlock(model_name, local_dir, skip_existing=skip_existing))
 
-    def rsync_to_gs(self, path: str, gs_path: str, delete: bool = False, checksum: bool = False, contents: bool | None = None, check_exists: bool = False) -> None:
+    def rsync_to_gs(self, path: str, gs_path: str, delete: bool = False, checksum: bool = False, contents: bool | None = True, check_exists: bool = False) -> None:
         """Add a Google Cloud Storage rsync upload block to this task."""
         self.blocks.append(RsyncToGSTaskBlock(path, gs_path, delete=delete, checksum=checksum, contents=contents, check_exists=check_exists))
 
-    def rsync_from_gs(self, gs_path: str, path: str, delete: bool = False, checksum: bool = False, skip_existing: bool = True, contents: bool | None = None, check_exists: bool = False) -> None:
+    def rsync_from_gs(self, gs_path: str, path: str, delete: bool = False, checksum: bool = False, skip_existing: bool = True, contents: bool | None = True, check_exists: bool = False) -> None:
         """Add a Google Cloud Storage rsync download block to this task."""
         self.blocks.append(RsyncFromGSTaskBlock(gs_path, path, delete=delete, checksum=checksum, skip_existing=skip_existing, contents=contents, check_exists=check_exists))
 
@@ -152,12 +214,14 @@ class CommandTaskBlock(TaskBlock):
         kwargs: Dict[str, Any] | None = None,
         vformat: str | None = None,
         kwformat: str | None = None,
+        flagformat: str | None = None,
     ) -> None:
         self.command = command
         self.vargs = vargs or []
         self.kwargs = kwargs or {}
         self.vformat = vformat or '{v}'
         self.kwformat = kwformat or '--{k} \'{v}\''
+        self.flagformat = flagformat or '--{k}'
 
     def execute(self) -> str:
         """Build the complete command string with formatted arguments."""
@@ -170,11 +234,19 @@ class CommandTaskBlock(TaskBlock):
         
         # Add keyword arguments
         if self.kwargs:
-            kwargs_filtered = {k: v for k, v in self.kwargs.items() if v is not None}
-            kwargs_str = ' '.join(
-                self.kwformat.format(k=k, v=v) for k, v in kwargs_filtered.items()
-            )
-            parts.append(kwargs_str)
+            formatted_kwargs: List[str] = []
+            for k, v in self.kwargs.items():
+                # Omit None and False values entirely
+                if v is None:
+                    continue
+                if isinstance(v, bool):
+                    if v:
+                        formatted_kwargs.append(self.flagformat.format(k=k))
+                    # If False, omit entirely
+                    continue
+                formatted_kwargs.append(self.kwformat.format(k=k, v=v))
+            if formatted_kwargs:
+                parts.append(' '.join(formatted_kwargs))
         
         return ' '.join(parts)
 
@@ -229,10 +301,12 @@ class UploadToGSTaskBlock(TaskBlock):
         path: str,
         gs_path: str,
         directory: bool = False,
+        contents: bool | None = True,
     ) -> None:
         self.path = path
         self.gs_path = gs_path  # Should be gs://bucket/path format
         self.directory = directory
+        self.contents = contents  # If True, add trailing slashes; if False, remove; if None, leave
     
     def execute(self) -> str:
         """Generate a locked gsutil upload command."""
@@ -240,12 +314,24 @@ class UploadToGSTaskBlock(TaskBlock):
         path_hash = hashlib.sha256(self.path.encode("utf-8")).hexdigest()[:10]
         lockfile = f"/tmp/{path_hash}.lock"
 
+        # Prepare source and destination paths, respecting contents flag
+        source_path = self.path
+        dest_path = self.gs_path
+        if self.directory:
+            if self.contents is True:
+                # Copy contents: use wildcard on source, no trailing slash on dest
+                source_path = source_path.rstrip('/') + '/*'
+                dest_path = dest_path.rstrip('/')
+            elif self.contents is False:
+                source_path = source_path.rstrip('/')
+                dest_path = dest_path.rstrip('/')
+
         # Build the gsutil command
         if self.directory:
             # Use -m for parallel operations and -r for recursive
-            gsutil_cmd = f"gsutil -m cp -r {dquote(self.path)} {dquote(self.gs_path)}"
+            gsutil_cmd = f"gsutil -m cp -r {dquote(source_path)} {dquote(dest_path)}"
         else:
-            gsutil_cmd = f"gsutil cp {dquote(self.path)} {dquote(self.gs_path)}"
+            gsutil_cmd = f"gsutil cp {dquote(source_path)} {dquote(dest_path)}"
 
         # Wrap in an exclusive file lock to prevent race conditions
         return f"flock -x {dquote(lockfile)} -c {dquote(gsutil_cmd)}"
@@ -260,11 +346,13 @@ class DownloadFromGSTaskBlock(TaskBlock):
         path: str,
         directory: bool = False,
         skip_existing: bool = True,
+        contents: bool | None = True,
     ) -> None:
         self.gs_path = gs_path  # Should be gs://bucket/path format
         self.path = path  # Local destination path
         self.directory = directory
         self.skip_existing = skip_existing
+        self.contents = contents  # If True, add trailing slashes; if False, remove; if None, leave
 
     def execute(self) -> str:
         """Generate a locked gsutil download command."""
@@ -279,15 +367,27 @@ class DownloadFromGSTaskBlock(TaskBlock):
         if self.skip_existing:
             inner_parts.append(f"[ ! -e {dquote(self.path)} ]")
         
+        # Prepare source and destination paths, respecting contents flag
+        source_path = self.gs_path
+        dest_path = self.path
+        if self.directory:
+            if self.contents is True:
+                # Copy contents: use wildcard on source, no trailing slash on dest
+                source_path = source_path.rstrip('/') + '/*'
+                dest_path = dest_path.rstrip('/')
+            elif self.contents is False:
+                source_path = source_path.rstrip('/')
+                dest_path = dest_path.rstrip('/')
+
         # Create necessary directories before download
         if self.directory:
-            inner_parts.append(f"mkdir -p -- {dquote(self.path)}")
+            inner_parts.append(f"mkdir -p -- {dquote(self.path.rstrip('/'))}")
             # Use -m for parallel operations and -r for recursive
-            gsutil_cmd = f"gsutil -m cp -r {dquote(self.gs_path)} {dquote(self.path)}"
+            gsutil_cmd = f"gsutil -m cp -r {dquote(source_path)} {dquote(dest_path)}"
         else:
             parent = os.path.dirname(self.path) or "."
             inner_parts.append(f"mkdir -p -- {dquote(parent)}")
-            gsutil_cmd = f"gsutil cp {dquote(self.gs_path)} {dquote(self.path)}"
+            gsutil_cmd = f"gsutil cp {dquote(source_path)} {dquote(dest_path)}"
         
         inner_parts.append(gsutil_cmd)
         
@@ -1035,17 +1135,31 @@ class PrintExecutor(Executor):
 
     def __init__(
         self,
-        artifact_path: str,
-        code_path: str,
+        artifact_path: str | None = None,
+        code_path: str | None = None,
         gs_path: str | None = None,
         setup_command: str | None = None,
     ) -> None:
         super().__init__()
+        mgr = ConfigManager()
+        global_conf = mgr.ensure_config()
+        proj_name = Project.name
+        proj_conf: Dict[str, Any] = {}
+        if proj_name is not None:
+            try:
+                proj_conf = mgr.load_project_config(proj_name).get("config", {})
+            except Exception:
+                proj_conf = {}
+        if artifact_path is None:
+            artifact_path = proj_conf.get("artifact_path") or str(mgr.get_project_dir(proj_name or "default") / "artifacts")
+        if code_path is None:
+            code_path = proj_conf.get("code_path") or str(Path.cwd())
         self.artifact_path = Path(artifact_path)
         self.code_path = Path(code_path)
         self.gs_path = gs_path
         self.setup_command = setup_command
         self._verbose_filtering = False  # Don't print filter messages for print command
+        self._global_config = global_conf
 
     def compile_artifact(self, artifact: Artifact) -> Task:
         """Compile an artifact into a task by calling its construct method."""
@@ -1065,6 +1179,16 @@ class PrintExecutor(Executor):
         print("set -euo pipefail")
         print()
         
+        # Export project configuration
+        try:
+            proj_conf = ConfigManager().load_project_config(Project.name or "").get("config", {})
+        except Exception:
+            proj_conf = {}
+        import json as _json
+        proj_conf_str = _json.dumps(proj_conf, separators=(",", ":"))
+        print(f"export EXPERIMENTS_PROJECT_CONF={dquote(proj_conf_str)}")
+        print()
+
         # Run setup commands if provided
         if self.setup_command:
             print(self.setup_command)
@@ -1072,6 +1196,11 @@ class PrintExecutor(Executor):
         
         for tier in tiers:
             for task in tier:
+                # Export per-task experiment config
+                if task.artifact is not None:
+                    exp_conf = _artifact_experiment_conf(task.artifact)
+                    exp_conf_str = _safe_json_dumps(exp_conf)
+                    print(f"export EXPERIMENTS_EXPERIMENT_CONF={dquote(exp_conf_str)}")
                 for block in task.blocks:
                     command = block.execute()
                     if command:
@@ -1088,8 +1217,8 @@ class SlurmExecutor(Executor):
 
     def __init__(
         self,
-        artifact_path: str,
-        code_path: str,
+        artifact_path: str | None = None,
+        code_path: str | None = None,
         project: str | None = None,
         gs_path: str | None = None,
         default_slurm_args: Dict[str, Any] | None = None,
@@ -1097,9 +1226,23 @@ class SlurmExecutor(Executor):
         setup_command: str | None = None,
     ) -> None:
         super().__init__()
+        # Initialize project context if provided
+        if project and (Project.name is None or Project.name != project):
+            Project.init(project)
+        mgr = ConfigManager()
+        global_conf = mgr.ensure_config()
+        proj_name = Project.name or project or "default"
+        try:
+            proj_conf: Dict[str, Any] = mgr.load_project_config(proj_name).get("config", {})
+        except Exception:
+            proj_conf = {}
+        if artifact_path is None:
+            artifact_path = proj_conf.get("artifact_path") or str(mgr.get_project_dir(proj_name) / "artifacts")
+        if code_path is None:
+            code_path = proj_conf.get("code_path") or str(Path.cwd())
         self.artifact_path = Path(artifact_path)
         self.code_path = Path(code_path)
-        self.project = project
+        self.project = Project.name or project
         self.gs_path = gs_path
         self.default_slurm_args = default_slurm_args or {}
         self.default_slurm_args_by_partition: Dict[str, Dict[str, Any]] = {}
@@ -1107,9 +1250,12 @@ class SlurmExecutor(Executor):
         self.setup_command = setup_command
         self._next_fake_job_id = 1000  # For dry run mode
         self._dry_run_jobs: List[Dict[str, Any]] = []  # Store job info for dry run summary
-        self.config_manager: Any = None  # Will be set by CLI
-        self.config: Dict[str, Any] = {}
         self.external_dependencies: List[str] = []  # External job IDs to depend on
+        self.cli_slurm_overrides: Dict[str, Any] = {}  # Highest-priority overrides from CLI
+        self.force_launch: bool = False
+        self._active_jobs: Set[tuple] = set()
+        self._launched_map: Dict[str, Any] = {}
+        self._global_config: Dict[str, Any] = global_conf
 
     def auto_cli(self) -> None:
         """Launch the CLI interface for this executor."""
@@ -1138,6 +1284,21 @@ class SlurmExecutor(Executor):
         artifact_to_job_id: Dict[int, str] = {}
         all_job_ids: List[str] = []
         
+        # Pre-compute group count for progress bar
+        total_groups = 0
+        for _tier in tiers:
+            if not _tier:
+                continue
+            _groups = self._group_tasks_by_requirements(_tier)
+            for _, _tasks in _groups.items():
+                _filtered = _tasks
+                if not self.force_launch:
+                    _filtered = [t for t in _tasks if self._should_launch_task(t)]
+                if _filtered:
+                    total_groups += 1
+
+        progress = _Progress(total=2 + total_groups, desc="Preparing launch")
+
         if self.dry_run:
             print("\n" + "=" * 100, file=sys.stderr)
             print("DRY RUN MODE - No jobs will be submitted", file=sys.stderr)
@@ -1150,7 +1311,16 @@ class SlurmExecutor(Executor):
             if hasattr(self, 'external_dependencies') and self.external_dependencies:
                 print(f"External dependencies: {', '.join(self.external_dependencies)}", file=sys.stderr)
             print("=" * 80 + "\n", file=sys.stderr)
-        
+
+        # Load and prune launched jobs mapping, and capture active jobs from squeue
+        progress.set("Scanning running jobs")
+        self._active_jobs = self._get_active_jobs()
+        progress.advance(1)
+        progress.set("Pruning launch history")
+        self._launched_map = self._load_launched_jobs()
+        self._prune_launched_jobs()
+        progress.advance(1)
+
         for tier_index, tier in enumerate(tiers):
             if not tier:
                 continue
@@ -1166,6 +1336,7 @@ class SlurmExecutor(Executor):
                 artifact_to_job_id=artifact_to_job_id,
                 stage_names=stage_names,
                 jobs=jobs,
+                progress=progress,
             )
             
             # Track all submitted jobs (deduplicate since multiple artifacts can map to same job)
@@ -1182,6 +1353,13 @@ class SlurmExecutor(Executor):
             # Print final summary for actual launch
             self._print_launch_summary(all_job_ids)
 
+        # Persist launched mapping after launch
+        if not self.dry_run:
+            self._save_launched_jobs(self._launched_map)
+
+        progress.set("Done")
+        progress.close()
+
     def _submit_tier(
         self,
         tier_index: int,
@@ -1189,6 +1367,7 @@ class SlurmExecutor(Executor):
         artifact_to_job_id: Dict[int, str],
         stage_names: List[str] | None = None,
         jobs: int | None = None,
+        progress: _Progress | None = None,
     ) -> Dict[int, str]:
         """Submit a tier as one or more Slurm array jobs.
         
@@ -1216,6 +1395,11 @@ class SlurmExecutor(Executor):
         
         # Submit a separate job for each requirement group
         for group_index, (requirements, tasks) in enumerate(task_groups.items()):
+            # Optionally filter out tasks that already have running jobs (unless force)
+            if not self.force_launch:
+                tasks = [t for t in tasks if self._should_launch_task(t)]
+            if not tasks:
+                continue
             job_name = f"tier-{tier_index}"
             if len(task_groups) > 1:
                 job_name += f"-grp{group_index}"
@@ -1230,6 +1414,9 @@ class SlurmExecutor(Executor):
             if hasattr(self, 'external_dependencies') and self.external_dependencies:
                 dependency_job_ids = list(set(dependency_job_ids) | set(self.external_dependencies))
                 dependency_job_ids.sort()
+
+            if progress is not None:
+                progress.set(f"Submitting tier {tier_index} group {group_index + 1}/{len(task_groups)}")
             
             # Generate the sbatch script
             sbatch_header = self._build_sbatch_header(
@@ -1246,6 +1433,8 @@ class SlurmExecutor(Executor):
             
             # Submit the job (or fake it in dry run mode)
             job_id = self._submit_sbatch_script(script_path)
+            if progress is not None:
+                progress.advance(1)
             
             # Map all artifacts in this group to this job ID
             for task in tasks:
@@ -1298,10 +1487,31 @@ class SlurmExecutor(Executor):
             if self.dry_run:
                 self._dry_run_jobs.append(job_info)
             
-            # Save job info to persistent storage (if config manager available and project set)
-            if self.config_manager and self.project and not self.dry_run:
-                if group_stage:
-                    self.config_manager.save_job_info(self.project, group_stage, job_info)
+            # Save job info to persistent storage (per-project)
+            if self.project and not self.dry_run and group_stage:
+                ConfigManager().save_job_info(self.project, group_stage, job_info)
+
+            # Record relpath -> {job_id, array_index} mappings for launched tasks
+            if not self.dry_run:
+                # Determine array index mapping for each task
+                if jobs is not None and jobs > 0 and jobs < len(tasks):
+                    # Round-robin assignment used in _build_script_body
+                    for idx, task in enumerate(tasks):
+                        if task.artifact is None:
+                            continue
+                        array_index = idx % jobs
+                        self._launched_map[task.artifact.relpath] = {
+                            'job_id': job_id,
+                            'array_index': array_index,
+                        }
+                else:
+                    for idx, task in enumerate(tasks):
+                        if task.artifact is None:
+                            continue
+                        self._launched_map[task.artifact.relpath] = {
+                            'job_id': job_id,
+                            'array_index': idx,
+                        }
             
             # Print brief summary (not in dry run mode)
             if not self.dry_run:
@@ -1462,22 +1672,48 @@ class SlurmExecutor(Executor):
         # Convert tuple back to dict
         reqs = dict(requirements_tuple)
         
-        # Start with global defaults
+        # Start with executor-level defaults
         config: Dict[str, Any] = {}
         config.update(self.default_slurm_args)
-        
-        # Get default partition
-        default_partition = self.config.get('default_partition', 'general')
-        
-        # Determine which partition to use for partition-specific defaults
+
+        # Global config defaults
+        global_defaults = dict(self._global_config.get('default_slurm_args', {}))
+        default_partition = self._global_config.get('default_partition', 'general')
+
+        # Project overrides
+        project_overrides: Dict[str, Any] = {}
+        if Project.name:
+            try:
+                _pconf = ConfigManager().load_project_config(Project.name).get('config', {})
+                project_overrides = dict(_pconf.get('default_slurm_args', {}))
+                default_partition = _pconf.get('default_partition', default_partition)
+            except Exception:
+                project_overrides = {}
+
+        # Determine partition
         partition = reqs.get('partition', config.get('partition', default_partition))
         
-        # Apply partition-specific defaults if available
-        if partition in self.default_slurm_args_by_partition:
-            config.update(self.default_slurm_args_by_partition[partition])
-        
-        # Apply artifact-specific requirements (highest priority)
+        # Apply partition-specific defaults from global
+        if isinstance(global_defaults, dict) and partition in global_defaults:
+            part_defaults = global_defaults.get(partition, {})
+            if isinstance(part_defaults, dict):
+                config.update(part_defaults)
+
+        # Apply project-level overrides
+        if isinstance(project_overrides, dict):
+            if partition in project_overrides and isinstance(project_overrides[partition], dict):
+                config.update(project_overrides[partition])
+            else:
+                for k, v in project_overrides.items():
+                    if isinstance(v, (str, int, float, bool)):
+                        config[k] = v
+
+        # Apply artifact-specific requirements
         config.update(reqs)
+
+        # Apply CLI overrides (highest priority)
+        if getattr(self, 'cli_slurm_overrides', None):
+            config.update(self.cli_slurm_overrides)
         
         # Apply final defaults only if not set
         config.setdefault('partition', default_partition)
@@ -1502,10 +1738,82 @@ class SlurmExecutor(Executor):
                     # Single GPU name like "A6000"
                     config['cpus_per_task'] = 1
         
+        # Normalize cpus -> cpus_per_task even if provided via defaults/overrides
+        if 'cpus' in config and 'cpus_per_task' not in config:
+            config['cpus_per_task'] = config.pop('cpus')
+        elif 'cpus' in config and 'cpus_per_task' in config:
+            config.pop('cpus')
+
         # Final fallback for cpus_per_task
         config.setdefault('cpus_per_task', 1)
         
         return config
+
+    # ---- Running job tracking helpers ----
+    def _get_active_jobs(self) -> Set[tuple]:
+        """Return set of (job_id, array_index_or_None) for current user's squeue."""
+        try:
+            user = os.environ.get('USER', '')
+            cmd = ["squeue", "-h"]
+            if user:
+                cmd += ["-u", user]
+            cmd += ["-o", "%A %a %T"]
+            result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+            active: Set[tuple] = set()
+            for line in result.stdout.splitlines():
+                parts = line.strip().split(None, 2)
+                if not parts:
+                    continue
+                job_id = parts[0]
+                array_idx_str = parts[1] if len(parts) > 1 else "N/A"
+                array_index = None if array_idx_str in ("N/A", "-1") else array_idx_str
+                active.add((job_id, array_index))
+            return active
+        except Exception:
+            return set()
+
+    def _load_launched_jobs(self) -> Dict[str, Any]:
+        try:
+            if self.project:
+                return ConfigManager().load_launched_jobs(self.project)
+        except Exception:
+            return {}
+        return {}
+
+    def _save_launched_jobs(self, mapping: Dict[str, Any]) -> None:
+        try:
+            if self.project:
+                ConfigManager().save_launched_jobs(self.project, mapping)
+        except Exception:
+            pass
+
+    def _prune_launched_jobs(self) -> None:
+        """Remove entries from launched map that are no longer active."""
+        if not self._launched_map:
+            return
+        pruned: Dict[str, Any] = {}
+        for relpath, info in self._launched_map.items():
+            job_id = str(info.get('job_id', ''))
+            arr = info.get('array_index', None)
+            key = (job_id, None if arr is None else str(arr))
+            if key in self._active_jobs or (job_id, None) in self._active_jobs:
+                pruned[relpath] = info
+        self._launched_map = pruned
+        if not self.dry_run and self.project:
+            self._save_launched_jobs(self._launched_map)
+
+    def _should_launch_task(self, task: Task) -> bool:
+        if task.artifact is None:
+            return True
+        rel = task.artifact.relpath
+        info = self._launched_map.get(rel)
+        if not info:
+            return True
+        job_id = str(info.get('job_id', ''))
+        arr = info.get('array_index', None)
+        key_specific = (job_id, None if arr is None else str(arr))
+        key_any = (job_id, None)
+        return not (key_specific in self._active_jobs or key_any in self._active_jobs)
 
     def _build_sbatch_header(
         self,
@@ -1530,7 +1838,7 @@ class SlurmExecutor(Executor):
         lines.append(f"#SBATCH --job-name={job_name}")
         
         # Log file paths
-        log_dir = self.config.get('log_directory', str(Path.home() / ".experiments" / "logs"))
+        log_dir = self._global_config.get('log_directory', str(Path.home() / ".experiments" / "logs"))
         Path(log_dir).mkdir(parents=True, exist_ok=True)
         
         # Use custom output/error paths if provided, otherwise use defaults
@@ -1638,6 +1946,15 @@ class SlurmExecutor(Executor):
             lines.append(self.setup_command)
             lines.append("")
         
+        # Export project configuration for all tasks
+        try:
+            proj_conf = ConfigManager().load_project_config(Project.name or "").get("config", {})
+        except Exception:
+            proj_conf = {}
+        proj_conf_str = _safe_json_dumps(proj_conf)
+        lines.append(f"export EXPERIMENTS_PROJECT_CONF={dquote(proj_conf_str)}")
+        lines.append("")
+        
         lines.append("case \"${SLURM_ARRAY_TASK_ID:-0}\" in")
         
         # Redistribute tasks if jobs_limit is specified
@@ -1654,6 +1971,10 @@ class SlurmExecutor(Executor):
                     continue
                 lines.append(f"  {group_idx})")
                 for task in tasks:
+                    if task.artifact is not None:
+                        exp_conf = _artifact_experiment_conf(task.artifact)
+                        exp_conf_str = _safe_json_dumps(exp_conf)
+                        lines.append(f"    export EXPERIMENTS_EXPERIMENT_CONF={dquote(exp_conf_str)}")
                     for block in task.blocks:
                         command = block.execute()
                         if command:
@@ -1666,6 +1987,10 @@ class SlurmExecutor(Executor):
             # Original behavior: one case per task
             for idx, task in enumerate(tier):
                 lines.append(f"  {idx})")
+                if task.artifact is not None:
+                    exp_conf = _artifact_experiment_conf(task.artifact)
+                    exp_conf_str = _safe_json_dumps(exp_conf)
+                    lines.append(f"    export EXPERIMENTS_EXPERIMENT_CONF={dquote(exp_conf_str)}")
                 for block in task.blocks:
                     command = block.execute()
                     if command:
@@ -1858,3 +2183,62 @@ class SlurmExecutor(Executor):
         print("Use 'python <script> history' to view full details", file=sys.stderr)
         print("Use 'python <script> cat <job_id>' to view logs", file=sys.stderr)
         print("=" * 80 + "\n", file=sys.stderr)
+
+
+# ---- Helpers for JSON-safe serialization ----
+def _is_json_scalar(x: Any) -> bool:
+    return isinstance(x, (str, int, float, bool)) or x is None
+
+
+def _json_sanitize(obj: Any) -> Any:
+    if _is_json_scalar(obj):
+        return obj
+    if isinstance(obj, dict):
+        out: Dict[str, Any] = {}
+        for k, v in obj.items():
+            try:
+                val = _json_sanitize(v)
+                if val is not None:
+                    out[str(k)] = val
+            except Exception:
+                continue
+        return out
+    if isinstance(obj, (list, tuple)):
+        out_list: List[Any] = []
+        for v in obj:
+            try:
+                val = _json_sanitize(v)
+                out_list.append(val)
+            except Exception:
+                continue
+        return out_list
+    return None
+
+
+def _safe_json_dumps(obj: Any) -> str:
+    try:
+        return json.dumps(_json_sanitize(obj), separators=(",", ":"))
+    except Exception:
+        return "{}"
+
+
+def _artifact_experiment_conf(artifact: Artifact) -> Dict[str, Any]:
+    data: Dict[str, Any] = {}
+    try:
+        data.update(artifact.as_dict())
+    except Exception:
+        data = {}
+    try:
+        for name, val in artifact.__class__.__dict__.items():
+            if isinstance(val, property) and val.fget is not None:
+                try:
+                    data[name] = getattr(artifact, name)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    try:
+        data["relpath"] = artifact.relpath
+    except Exception:
+        pass
+    return _json_sanitize(data)
