@@ -7,7 +7,7 @@ that have already been executed.
 
 from dataclasses import dataclass
 from pathlib import Path
-from experiments import Artifact, SlurmExecutor, Task
+from experiments import Artifact, SlurmExecutor, Task, Project
 
 
 @dataclass
@@ -62,12 +62,9 @@ class EvaluateModel(Artifact):
 
 
 if __name__ == "__main__":
-    # Create executor
-    executor = SlurmExecutor(
-        artifact_path="./artifacts",
-        code_path=".",
-        project="exists_demo",
-    )
+    # Initialize project and create executor (paths can be configured via project.json)
+    Project.init('exists_demo')
+    executor = SlurmExecutor()
     
     # Create artifacts
     # If checkpoint.pt exists for resnet50, it will be skipped

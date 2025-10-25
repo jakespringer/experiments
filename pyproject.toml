@@ -19,6 +19,10 @@ classifiers = [
 ]
 dependencies = ["pyyaml"]
 
+[project.scripts]
+jobcat = "experiments.scripts.jobcat:main"
+jobattach = "experiments.scripts.jobattach:main"
+
 [project.urls]
 Homepage = "https://example.com"
 

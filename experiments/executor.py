@@ -705,7 +705,13 @@ class Executor:
         self._verbose_filtering: bool = True  # Whether to print filter messages
 
     def stage(self, name: str, artifacts: Iterable[Artifact] | ArtifactSet) -> None:
-        """Register a named stage containing artifacts to execute."""
+        """Register a named stage containing artifacts to execute.
+        
+        Accepts a single `Artifact`, an `ArtifactSet`, or any iterable of `Artifact`s.
+        A single `Artifact` is wrapped into an `ArtifactSet` for consistency.
+        """
+        if isinstance(artifacts, Artifact):
+            artifacts = ArtifactSet([artifacts])
         self._stages[name] = list(artifacts)
 
     def auto_cli(self) -> None:

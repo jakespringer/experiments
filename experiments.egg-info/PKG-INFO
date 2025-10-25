@@ -1,3 +1,17 @@
+Metadata-Version: 2.4
+Name: experiments
+Version: 0.0.1
+Summary: Lightweight experiment staging primitives (artifacts, tasks, executors)
+Author: Jacob Springer
+License: MIT
+Project-URL: Homepage, https://example.com
+Classifier: Programming Language :: Python :: 3
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Operating System :: OS Independent
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+Requires-Dist: pyyaml
+
 # Experiments Framework
 
 A lightweight Python framework for defining and running large-scale experiments on Slurm clusters.
@@ -401,94 +415,6 @@ builder.set_env('CUDA_VISIBLE_DEVICES', '0,1,2,3')
 # Set from command output
 builder.set_env('NUM_GPUS', 'nvidia-smi --list-gpus | wc -l', from_command=True)
 ```
-
-### Runtime helpers (runlib)
-
-Utilities for reading runtime configs, creating temporary workspaces, grabbing a free TCP port, and performing high-level Google Cloud Storage (GCS) I/O at runtime.
-
-Import:
-
-```python
-from experiments.runlib import (
-  get_project_config, get_experiment_config, get_relpath,
-  make_temp_dir, temporary_workspace, get_free_port,
-  download_from_gs, upload_to_gs, sync_from_gs, sync_to_gs,
-  pop_from_gs, push_to_gs, check_exists,
-  gs_read_text, gs_read_bytes, gs_write_text, gs_write_bytes, gs_open,
-  gs_list, gs_delete,
-)
-```
-
-Config accessors (provided via env by the launcher):
-
-```python
-proj = get_project_config()     # EXPERIMENTS_PROJECT_CONF (attribute access)
-exp  = get_experiment_config()  # EXPERIMENTS_EXPERIMENT_CONF (attribute access)
-rel  = get_relpath()            # shorthand for exp.relpath
-```
-
-Temporary workspaces (prefers in-memory `/dev/shm`):
-
-```python
-tmp = make_temp_dir(prefix="exp_")
-with temporary_workspace() as d:
-    ...  # cleaned automatically on exit
-```
-
-Free TCP port:
-
-```python
-port = get_free_port()
-```
-
-High-level GCS helpers (lazy optional dependency `google-cloud-storage`):
-
-- `download_from_gs(remote, local, directory='auto', concurrent=True, ensure_contents=True, retry=0, max_workers=8)`
-- `upload_to_gs(local, remote, directory='auto', concurrent=True, ensure_contents=True, retry=0, max_workers=8)`
-- `sync_from_gs(remote, local, directory='auto', concurrent=True, ensure_contents=True, delete=False, checksum=False, retry=0, max_workers=8)`
-- `sync_to_gs(local, remote, directory='auto', concurrent=True, ensure_contents=True, delete=False, checksum=False, retry=0, max_workers=8)`
-- `pop_from_gs(remote, local, ...)` (download then delete remote)
-- `push_to_gs(local, remote, ...)` (upload then delete local)
-- `check_exists(remote_or_list, max_ancestors=None)` (efficient multi-path existence check)
-
-Contents semantics:
-
-- Local `.../dir/*` means “use the directory’s contents.”
-- Remote `gs://.../path/.` means “write into this directory (contents).”
-
-Examples:
-
-```python
-# Upload only contents of local_dir into the remote directory, then delete local contents
-push_to_gs(f"{local_dir}/*", "gs://bucket/some/path/.")
-
-# Download into local_dir without extra nesting
-download_from_gs("gs://bucket/data/run123/.", local_dir)
-```
-
-Retries and errors:
-
-- `retry=n` performs n additional attempts (2s sleep between attempts).
-- Direct GCS calls pass `google.api_core.retry.Retry` and only retry known transient errors (`ServiceUnavailable`, `InternalServerError`, `TooManyRequests`, `DeadlineExceeded`, `GatewayTimeout`).
-- If all attempts fail, the original GCS exception is raised.
-
-Convenience IO:
-
-```python
-text = gs_read_text("gs://bucket/file.txt", retry=2)
-data = gs_read_bytes("gs://bucket/blob.bin")
-gs_write_text("gs://bucket/logs/out.txt", "hello")
-gs_write_bytes("gs://bucket/raw.bin", b"\x00\x01")
-
-with gs_open("gs://bucket/stream.ndjson", "rb") as f:
-    for line in f:
-        ...
-
-blobs = gs_list("gs://bucket/prefix/")
-gs_delete("gs://bucket/tmp/run123/", recursive=True)
-```
-
-See `examples/random_files/` for an artifact (`RandomFiles`) and a runtime script (`create_random_files.py`) that creates files locally and, after each file is written, pushes only the directory contents to GCS using `push_to_gs(f"{local_root}/*", f"{remote_root}/.")`.
 
 ### Slurm Resource Requirements
 
