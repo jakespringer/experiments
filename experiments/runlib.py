@@ -623,26 +623,29 @@ def download_from_gs(
             
             _ensure_dir(local_root)
             
-            # Prepare blob names and destination paths
-            blob_names = []
+            # Prepare blobs and destination paths for download
+            # Use transfer_manager.download_many for concurrent downloads
+            blob_file_pairs = []
+            
             for blob_name in blobs:
                 relative = blob_name[len(prefix):] if blob_name.startswith(prefix) else blob_name
                 if relative:
-                    blob_names.append(blob_name)
+                    local_file = local_root / relative
+                    _ensure_dir(local_file.parent)
+                    blob = bucket.blob(blob_name)
+                    blob_file_pairs.append((blob, str(local_file)))
             
-            if not blob_names:
+            if not blob_file_pairs:
                 return
             
-            # Use transfer manager for concurrent download
-            results = _transfer_manager_module.download_many_to_path(
-                bucket,
-                blob_names,
-                destination_directory=str(local_root),
+            # Use transfer manager for concurrent downloads
+            results = _transfer_manager_module.download_many(
+                blob_file_pairs,
                 max_workers=max_workers
             )
             
             # Check for errors
-            for name, result in zip(blob_names, results):
+            for (blob, dest_path), result in zip(blob_file_pairs, results):
                 if isinstance(result, Exception):
                     raise result
     
@@ -709,52 +712,24 @@ def upload_to_gs(
             if remote_prefix and not remote_prefix.endswith("/"):
                 remote_prefix += "/"
             
-            # Build mapping of source files to destination blob names
-            blob_names = []
-            source_files = []
-            
+            # Prepare filenames relative to source directory for transfer manager
+            filenames = []
             for source_file, relative in files_to_upload:
-                blob_name = remote_prefix + str(relative).replace("\\", "/")
-                blob_names.append(blob_name)
-                source_files.append(source_file)
+                filenames.append(str(relative).replace("\\", "/"))
             
-            # Create staging directory with proper structure
-            import tempfile
-            with tempfile.TemporaryDirectory() as staging_dir:
-                staging_path = Path(staging_dir)
-                
-                for source_file, blob_name in zip(source_files, blob_names):
-                    # Extract relative path from blob_name
-                    rel_path = blob_name[len(remote_prefix):] if blob_name.startswith(remote_prefix) else blob_name
-                    dest = staging_path / rel_path
-                    _ensure_dir(dest.parent)
-                    
-                    # Try hard link, fall back to symlink, then copy
-                    try:
-                        os.link(source_file, dest)
-                    except (OSError, NotImplementedError):
-                        try:
-                            os.symlink(source_file, dest)
-                        except (OSError, NotImplementedError):
-                            shutil.copy2(source_file, dest)
-                
-                # Prepare filenames for transfer manager
-                filenames = [str(staging_path / blob_name[len(remote_prefix):]) 
-                            for blob_name in blob_names]
-                
-                # Upload using transfer manager
-                results = _transfer_manager_module.upload_many_from_filenames(
-                    bucket,
-                    filenames,
-                    source_directory=str(staging_path),
-                    max_workers=max_workers,
-                    blob_name_prefix=remote_prefix
-                )
-                
-                # Check for errors
-                for name, result in zip(filenames, results):
-                    if isinstance(result, Exception):
-                        raise result
+            # Upload using transfer manager
+            results = _transfer_manager_module.upload_many_from_filenames(
+                bucket,
+                filenames,
+                source_directory=str(local_base),
+                max_workers=max_workers,
+                blob_name_prefix=remote_prefix
+            )
+            
+            # Check for errors
+            for name, result in zip(filenames, results):
+                if isinstance(result, Exception):
+                    raise result
     
     _with_retries(_upload, retry)
 
