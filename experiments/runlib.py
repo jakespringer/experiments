@@ -1,302 +1,566 @@
-from __future__ import annotations
+"""RUNLIB: Utility layer for experiments.
+
+Provides configuration access, temporary workspaces, free port finding,
+and high-performance Google Cloud Storage transfers with convenience I/O.
+"""
 
 import atexit
-import concurrent.futures
-import contextlib
-import io
 import json
 import os
 import shutil
 import socket
-import sys
-import tempfile
 import time
-from dataclasses import dataclass
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, Union
 
-# Use the same attribute-access view as Project to keep behavior consistent
-from .project import _ConfigView
+# Global caches
+_project_config_cache: Optional[Dict[str, Any]] = None
+_experiment_config_cache: Optional[Dict[str, Any]] = None
+_gcs_available: Optional[bool] = None
+_storage_module = None
+_transfer_manager_module = None
+_exceptions_module = None
+_retry_module = None
+_crc32c_module = None
 
 
-# -----------------------------
-# Config accessors (cached)
-# -----------------------------
+class _ConfigView:
+    """Read-only view of configuration dictionary."""
+    
+    def __init__(self, data: Dict[str, Any]):
+        self._data = data
+    
+    def __getitem__(self, key: str) -> Any:
+        return self._data[key]
+    
+    def __contains__(self, key: str) -> bool:
+        return key in self._data
 
-_CACHED_PROJECT_CONF: _ConfigView | None = None
-_CACHED_EXPERIMENT_CONF: _ConfigView | None = None
+    def __getattr__(self, name: str) -> Any:
+        return self._data[name]
 
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name in ("_data",):
+            object.__setattr__(self, name, value)
+        else:
+            raise AttributeError("Cannot set attributes on _ConfigView")
+    
+    def get(self, key: str, default=None) -> Any:
+        return self._data.get(key, default)
+    
+    def keys(self):
+        return self._data.keys()
+    
+    def values(self):
+        return self._data.values()
+    
+    def items(self):
+        return self._data.items()
+    
+    def __repr__(self):
+        return f"_ConfigView({self._data!r})"
+
+
+# ============================================================================
+# Configuration accessors
+# ============================================================================
 
 def _load_env_json(var_name: str) -> Dict[str, Any]:
-    raw = os.environ.get(var_name)
-    if not raw:
-        raise RuntimeError(
-            f"Missing {var_name}. This code must be launched via the experiments launcher."
-        )
+    """Helper to read and parse JSON from env var.
+    
+    Args:
+        var_name: Name of environment variable.
+        
+    Returns:
+        Parsed JSON dictionary.
+        
+    Raises:
+        RuntimeError: If env var is missing or contains invalid JSON.
+    """
+    value = os.environ.get(var_name)
+    if value is None:
+        raise RuntimeError(f"Environment variable {var_name} is not set")
+    
     try:
-        return json.loads(raw)
-    except Exception as e:  # pragma: no cover
-        raise RuntimeError(f"Invalid JSON in {var_name}: {e}") from e
+        return json.loads(value)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"Failed to parse {var_name} as JSON: {e}")
 
 
 def get_project_config() -> _ConfigView:
-    global _CACHED_PROJECT_CONF
-    if _CACHED_PROJECT_CONF is None:
-        data = _load_env_json("EXPERIMENTS_PROJECT_CONF")
-        _CACHED_PROJECT_CONF = _ConfigView(data)
-    return _CACHED_PROJECT_CONF
+    """Returns cached project-level config from EXPERIMENTS_PROJECT_CONF env var.
+    
+    Returns:
+        Read-only view of project configuration.
+        
+    Raises:
+        RuntimeError: If env var missing or invalid JSON.
+    """
+    global _project_config_cache
+    if _project_config_cache is None:
+        _project_config_cache = _load_env_json("EXPERIMENTS_PROJECT_CONF")
+    return _ConfigView(_project_config_cache)
 
 
 def get_experiment_config() -> _ConfigView:
-    global _CACHED_EXPERIMENT_CONF
-    if _CACHED_EXPERIMENT_CONF is None:
-        data = _load_env_json("EXPERIMENTS_EXPERIMENT_CONF")
-        _CACHED_EXPERIMENT_CONF = _ConfigView(data)
-    return _CACHED_EXPERIMENT_CONF
+    """Returns cached experiment-level config from EXPERIMENTS_EXPERIMENT_CONF env var.
+    
+    Returns:
+        Read-only view of experiment configuration.
+        
+    Raises:
+        RuntimeError: If env var missing or invalid JSON.
+    """
+    global _experiment_config_cache
+    if _experiment_config_cache is None:
+        _experiment_config_cache = _load_env_json("EXPERIMENTS_EXPERIMENT_CONF")
+    return _ConfigView(_experiment_config_cache)
 
 
 def get_relpath() -> str:
-    cfg = get_experiment_config()
-    try:
-        return str(getattr(cfg, "relpath"))
-    except Exception:
-        raise RuntimeError("Experiment config does not contain 'relpath'")
+    """Returns the relpath attribute from experiment config.
+    
+    Returns:
+        The relpath string.
+        
+    Raises:
+        RuntimeError: If relpath is not present in experiment config.
+    """
+    config = get_experiment_config()
+    if "relpath" not in config:
+        raise RuntimeError("relpath not found in experiment configuration")
+    return config["relpath"]
 
 
-# -----------------------------
-# Temporary directory helpers
-# -----------------------------
+# ============================================================================
+# Temporary workspace helpers
+# ============================================================================
 
-@dataclass
 class TemporaryWorkspace:
-    path: Path
-    _removed: bool = False
-
+    """Context manager for temporary workspace directories."""
+    
+    def __init__(self, path: Path):
+        self.path = path
+        self._removed = False
+    
     def cleanup(self) -> None:
+        """Recursively removes the directory if not already removed; idempotent."""
         if not self._removed and self.path.exists():
-            try:
-                shutil.rmtree(self.path, ignore_errors=True)
-            finally:
-                self._removed = True
-
+            shutil.rmtree(self.path)
+            self._removed = True
+    
     def __enter__(self) -> Path:
+        """Returns path to support with statement."""
         return self.path
-
-    def __exit__(self, exc_type, exc, tb) -> None:  # type: ignore[override]
+    
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        """Ensures cleanup on context exit."""
         self.cleanup()
 
 
 def _choose_tmp_root(filesystem: Optional[Union[str, Path]]) -> Path:
-    if filesystem:
-        root = Path(filesystem)
-        root.mkdir(parents=True, exist_ok=True)
-        return root
+    """Chooses base temp root.
+    
+    Args:
+        filesystem: Explicit directory to use, or None for automatic selection.
+        
+    Returns:
+        Path to use as temporary root.
+    """
+    if filesystem is not None:
+        path = Path(filesystem)
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+    
+    # Try /dev/shm if writable
     shm = Path("/dev/shm")
-    if shm.exists() and os.access(shm, os.W_OK | os.X_OK):
+    if shm.exists() and os.access(shm, os.W_OK):
         return shm
+    
+    # Fall back to system temp
+    import tempfile
     return Path(tempfile.gettempdir())
 
 
 def make_temp_dir(prefix: str = "exp_", filesystem: Optional[Union[str, Path]] = None) -> Path:
+    """Creates a temporary directory under a preferred root.
+    
+    Args:
+        prefix: Prefix for directory name.
+        filesystem: Explicit directory to use, or None for automatic selection.
+        
+    Returns:
+        Path to created directory.
+    """
+    import tempfile
     root = _choose_tmp_root(filesystem)
-    path = Path(tempfile.mkdtemp(prefix=prefix, dir=str(root)))
-    ws = TemporaryWorkspace(path)
-    atexit.register(ws.cleanup)
-    return path
+    temp_dir = Path(tempfile.mkdtemp(prefix=prefix, dir=root))
+    
+    # Register cleanup at exit
+    atexit.register(lambda: shutil.rmtree(temp_dir, ignore_errors=True))
+    
+    return temp_dir
 
 
-@contextlib.contextmanager
+@contextmanager
 def temporary_workspace(prefix: str = "exp_", filesystem: Optional[Union[str, Path]] = None) -> Iterator[Path]:
-    path = make_temp_dir(prefix=prefix, filesystem=filesystem)
-    ws = TemporaryWorkspace(Path(path))
+    """Context manager producing a temporary directory that is always cleaned up on exit.
+    
+    Args:
+        prefix: Prefix for directory name.
+        filesystem: Explicit directory to use, or None for automatic selection.
+        
+    Yields:
+        Path to temporary directory.
+    """
+    workspace = TemporaryWorkspace(make_temp_dir(prefix=prefix, filesystem=filesystem))
     try:
-        yield ws.path
+        yield workspace.path
     finally:
-        ws.cleanup()
+        workspace.cleanup()
 
 
-# -----------------------------
-# Networking helpers
-# -----------------------------
+# ============================================================================
+# Networking helper
+# ============================================================================
 
 def get_free_port() -> int:
+    """Returns an available TCP port on 127.0.0.1.
+    
+    Returns:
+        Available port number.
+    """
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind(("127.0.0.1", 0))
-        return int(s.getsockname()[1])
+        s.listen(1)
+        port = s.getsockname()[1]
+    return port
 
 
-# -----------------------------
-# Google Cloud Storage helpers
-# -----------------------------
-
-_GCS_IMPORTED = False
-_GCS_ERR: Optional[Exception] = None
-
+# ============================================================================
+# GCS utility internals
+# ============================================================================
 
 def _require_gcs() -> None:
-    global _GCS_IMPORTED, _GCS_ERR
-    if _GCS_IMPORTED:
+    """Lazily imports google-cloud-storage and related modules.
+    
+    Raises:
+        RuntimeError: If google-cloud-storage is not available.
+    """
+    global _gcs_available, _storage_module, _transfer_manager_module
+    global _exceptions_module, _retry_module, _crc32c_module
+    
+    if _gcs_available is not None:
+        if not _gcs_available:
+            raise RuntimeError(
+                "google-cloud-storage is not available. "
+                "Install with: pip install google-cloud-storage"
+            )
         return
+    
     try:
-        # Lazy import
-        from google.cloud import storage  # type: ignore  # noqa: F401
-        from google.cloud.storage import transfer_manager  # type: ignore  # noqa: F401
-        from google.api_core import retry as _retry  # type: ignore  # noqa: F401
-        from google.api_core import exceptions as _gexc  # type: ignore  # noqa: F401
-        _GCS_IMPORTED = True
-    except Exception as e:  # pragma: no cover
-        _GCS_ERR = e
+        from google.cloud import storage
+        from google.cloud.storage import transfer_manager
+        _storage_module = storage
+        _transfer_manager_module = transfer_manager
+        
+        try:
+            from google.api_core import exceptions as api_exceptions
+            from google.api_core import retry as api_retry
+            _exceptions_module = api_exceptions
+            _retry_module = api_retry
+        except ImportError:
+            _exceptions_module = None
+            _retry_module = None
+        
+        try:
+            import google_crc32c
+            _crc32c_module = google_crc32c
+        except ImportError:
+            _crc32c_module = None
+        
+        _gcs_available = True
+    except ImportError:
+        _gcs_available = False
         raise RuntimeError(
-            "google-cloud-storage is required for GCS operations. Install with 'pip install google-cloud-storage'."
-        ) from e
+            "google-cloud-storage is not available. "
+            "Install with: pip install google-cloud-storage"
+        )
 
 
 def _get_storage_client():
+    """Ensures GCS libs present and returns a storage.Client().
+    
+    Returns:
+        A google.cloud.storage.Client instance.
+    """
     _require_gcs()
-    from google.cloud import storage  # type: ignore
-
-    return storage.Client()
+    return _storage_module.Client()
 
 
 def _get_gcs_exceptions():
-    """Return a tuple of retryable google.api_core exception classes if available."""
-    try:
-        from google.api_core import exceptions as gexc  # type: ignore
-
-        retryables = []
-        for name in (
-            "ServiceUnavailable",
-            "InternalServerError",
-            "TooManyRequests",
-            "DeadlineExceeded",
-            "GatewayTimeout",
-        ):
-            cls = getattr(gexc, name, None)
-            if cls is not None:
-                retryables.append(cls)
-        # Fallback to base class if none found
-        base = getattr(gexc, "GoogleAPICallError", None)
-        if not retryables and base is not None:
-            retryables.append(base)
-        return tuple(retryables) if retryables else (Exception,)
-    except Exception:
+    """Returns a tuple of retryable google.api_core.exceptions classes.
+    
+    Returns:
+        Tuple of exception classes, or (Exception,) if unavailable.
+    """
+    _require_gcs()
+    if _exceptions_module is None:
         return (Exception,)
+    
+    return (
+        _exceptions_module.TooManyRequests,
+        _exceptions_module.ServiceUnavailable,
+        _exceptions_module.InternalServerError,
+        _exceptions_module.RequestRangeNotSatisfiable,
+    )
 
 
 def _build_gcs_retry(attempts: int):
-    """Build a google.api_core.retry.Retry with a retryable predicate.
-
-    If google.api_core.retry is unavailable or attempts <= 1, return None.
+    """Builds a google-api-core Retry object.
+    
+    Args:
+        attempts: Number of retry attempts.
+        
+    Returns:
+        Retry object or None if unavailable or attempts <= 0.
     """
-    if attempts is None or int(attempts) <= 0:
+    _require_gcs()
+    if _retry_module is None or attempts <= 0:
         return None
-    try:
-        from google.api_core import retry as gretry  # type: ignore
-        from google.api_core import exceptions as gexc  # type: ignore
-
-        def predicate(exc: BaseException) -> bool:
-            retryable_types = _get_gcs_exceptions()
-            return isinstance(exc, retryable_types)
-
-        # Configure a bounded backoff; attempts are enforced by our wrapper around
-        # transfer_manager calls; for direct API calls we rely on deadline to cap.
-        # Rough deadline: 2s per attempt with jitter handled by library
-        deadline = 2.0 * (int(attempts) + 1)
-        return gretry.Retry(predicate=predicate, initial=1.0, maximum=5.0, multiplier=2.0, deadline=deadline)
-    except Exception:
-        return None
+    
+    exceptions = _get_gcs_exceptions()
+    predicate = lambda exc: isinstance(exc, exceptions)
+    
+    return _retry_module.Retry(
+        predicate=predicate,
+        initial=1.0,
+        maximum=32.0,
+        multiplier=2.0,
+        deadline=None,
+    )
 
 
 def _parse_gs_path(gs_url: str) -> Tuple[str, str]:
+    """Splits gs://bucket/key... into (bucket, key).
+    
+    Args:
+        gs_url: GCS URL starting with gs://.
+        
+    Returns:
+        Tuple of (bucket_name, key).
+        
+    Raises:
+        ValueError: If not a gs:// URL.
+    """
     if not gs_url.startswith("gs://"):
         raise ValueError(f"Not a gs:// URL: {gs_url}")
-    without = gs_url[5:]
-    parts = without.split("/", 1)
-    bucket = parts[0]
-    key = parts[1] if len(parts) > 1 else ""
+    
+    path = gs_url[5:]  # Remove gs://
+    if "/" in path:
+        bucket, key = path.split("/", 1)
+    else:
+        bucket = path
+        key = ""
+    
     return bucket, key
 
 
 def _is_gs_path(path: str) -> bool:
+    """True if path starts with gs://.
+    
+    Args:
+        path: Path to check.
+        
+    Returns:
+        True if path is a GCS path.
+    """
     return path.startswith("gs://")
 
 
 def _ensure_dir(path: Union[str, Path]) -> None:
+    """mkdir -p equivalent.
+    
+    Args:
+        path: Directory path to create.
+    """
     Path(path).mkdir(parents=True, exist_ok=True)
 
 
 def _sleep(seconds: float) -> None:
+    """Thin wrapper around time.sleep.
+    
+    Args:
+        seconds: Number of seconds to sleep.
+    """
     time.sleep(seconds)
 
 
 def _with_retries(fn, retry: int) -> Any:
-    attempts = max(0, int(retry)) + 1
-    last_exc: Optional[BaseException] = None
-    retryable = _get_gcs_exceptions()
-    for i in range(attempts):
+    """Executes fn with up to retry + 1 attempts.
+    
+    Args:
+        fn: Callable to execute.
+        retry: Number of retries (0 means no retries).
+        
+    Returns:
+        Result of fn.
+        
+    Raises:
+        Last exception encountered.
+    """
+    exceptions = _get_gcs_exceptions()
+    last_error = None
+    
+    for attempt in range(retry + 1):
         try:
             return fn()
-        except retryable as e:  # type: ignore[misc]
-            last_exc = e
-            if i < attempts - 1:
-                _sleep(2.0)
+        except exceptions as e:
+            last_error = e
+            if attempt < retry:
+                _sleep(min(2 ** attempt, 32))
             else:
                 raise
-    return None
+    
+    if last_error:
+        raise last_error
 
 
 def _infer_remote_is_dir(bucket, key: str) -> bool:
-    from google.cloud import storage  # type: ignore
-
-    if key.endswith("/"):
+    """Heuristics to determine if remote key is a directory.
+    
+    Args:
+        bucket: GCS bucket object.
+        key: Object key.
+        
+    Returns:
+        True if key appears to be a directory.
+    """
+    # Explicit trailing / or /.
+    if key.endswith("/") or key.endswith("/."):
         return True
-    # Treat trailing '/.' as contents of a directory
-    if key.endswith("/."):
-        return True
+    
+    # Check if exact blob exists
     blob = bucket.blob(key)
     if blob.exists():
         return False
-    prefix = key.rstrip("/") + "/"
-    iterator = bucket.client.list_blobs(bucket, prefix=prefix, max_results=1)  # type: ignore[arg-type]
-    for _ in iterator:
-        return True
-    return False
+    
+    # Check if any blobs exist with this prefix
+    prefix = key if key.endswith("/") else key + "/"
+    blobs = list(bucket.list_blobs(prefix=prefix, max_results=1))
+    return len(blobs) > 0
 
 
-def _directory_flag_for_local(path: Union[str, Path], directory: Union[str, bool]) -> bool:
+def _directory_flag_for_local(path, directory: Union[str, bool]) -> bool:
+    """Resolves whether path should be treated as a directory.
+    
+    Args:
+        path: Local path.
+        directory: "auto", True, or False.
+        
+    Returns:
+        True if path should be treated as directory.
+    """
     if directory == "auto":
-        # Support trailing '/*' to denote contents of directory
-        p = str(path)
-        if isinstance(path, (str, Path)) and str(p).endswith("/*"):
+        path_str = str(path)
+        if path_str.endswith("/*"):
             return True
-        return Path(path).is_dir()
+        return Path(path_str.rstrip("/*")).is_dir()
     return bool(directory)
 
 
 def _directory_flag_for_remote(bucket, key: str, directory: Union[str, bool]) -> bool:
+    """Resolves whether remote is a directory.
+    
+    Args:
+        bucket: GCS bucket object.
+        key: Object key.
+        directory: "auto", True, or False.
+        
+    Returns:
+        True if remote should be treated as directory.
+    """
     if directory == "auto":
         return _infer_remote_is_dir(bucket, key)
     return bool(directory)
 
 
 def _parse_local_contents_spec(path: Union[str, Path]) -> Tuple[Path, bool]:
-    """Return (base_path, contents_only) where '/*' means contents-only."""
-    pstr = str(path)
-    if pstr.endswith("/*"):
-        base = Path(pstr[:-2])
-        return base, True
-    return Path(path), False
+    """Returns (base_path, contents_only) where trailing /* encodes contents-only.
+    
+    Args:
+        path: Local path possibly ending with /*.
+        
+    Returns:
+        Tuple of (base_path, contents_only).
+    """
+    path_str = str(path)
+    if path_str.endswith("/*"):
+        return Path(path_str[:-2]), True
+    return Path(path_str), False
 
 
 def _parse_remote_contents_spec(remote_path: str) -> Tuple[str, str, bool]:
-    """Return (bucket, key, contents_only) where trailing '/.' means contents-only."""
+    """Returns (bucket, key, contents_only) where trailing /. encodes contents-only.
+    
+    Args:
+        remote_path: GCS path possibly ending with /.
+        
+    Returns:
+        Tuple of (bucket, key, contents_only).
+    """
     bucket, key = _parse_gs_path(remote_path)
+    
     if key.endswith("/."):
-        key = key[:-2]
-        return bucket, key, True
+        return bucket, key[:-2], True
+    
     return bucket, key, False
 
+
+def _list_remote_tree(client, bucket, prefix: str, retry_obj=None) -> Dict[str, Any]:
+    """Lists all blobs under prefix into a name->blob mapping.
+    
+    Args:
+        client: Storage client.
+        bucket: Bucket object.
+        prefix: Prefix to list under.
+        retry_obj: Optional retry object.
+        
+    Returns:
+        Dictionary mapping blob names to blob objects.
+    """
+    blobs = {}
+    for blob in bucket.list_blobs(prefix=prefix, retry=retry_obj):
+        blobs[blob.name] = blob
+    return blobs
+
+
+def _crc32c_local(path: Path) -> Optional[str]:
+    """Computes base64-encoded CRC32C for local file.
+    
+    Args:
+        path: Path to local file.
+        
+    Returns:
+        Base64-encoded CRC32C or None if unavailable.
+    """
+    if _crc32c_module is None:
+        return None
+    
+    import base64
+    
+    hasher = _crc32c_module.Checksum()
+    with open(path, "rb") as f:
+        while chunk := f.read(8192):
+            hasher.update(chunk)
+    
+    return base64.b64encode(hasher.digest()).decode("ascii")
+
+
+# ============================================================================
+# Transfer operations
+# ============================================================================
 
 def download_from_gs(
     remote_path: str,
@@ -305,71 +569,84 @@ def download_from_gs(
     concurrent: bool = True,
     ensure_contents: bool = True,
     retry: int = 0,
-    max_workers: int = 8,
+    max_workers: int = 8
 ) -> None:
-    """Download file or directory from GCS.
-
-    ensure_contents semantics:
-      - file → write exactly to local_path
-      - directory → copy contents under local_path (no extra nesting)
+    """Downloads a single file or a directory tree from GCS to local filesystem.
+    
+    Args:
+        remote_path: GCS path (gs://bucket/key).
+        local_path: Local destination path.
+        directory: "auto", True, or False to indicate directory semantics.
+        concurrent: Use concurrent transfers (may be no-op).
+        ensure_contents: If True, places files directly under local_path.
+        retry: Number of retries for transient failures.
+        max_workers: Parallelism for transfer manager.
     """
-
-    def _impl() -> None:
+    _require_gcs()
+    
+    def _download():
         client = _get_storage_client()
-        from google.cloud.storage import transfer_manager  # type: ignore
-
-        bucket_name, key, remote_contents = _parse_remote_contents_spec(remote_path)
+        bucket_name, key, contents_only = _parse_remote_contents_spec(remote_path)
         bucket = client.bucket(bucket_name)
-
-        # If remote specified '/.', force contents semantics
-        if remote_contents:
-            directory = True
-            ensure_contents_flag = True
-        else:
-            ensure_contents_flag = ensure_contents
-
+        
+        retry_obj = _build_gcs_retry(retry)
+        
+        # Determine if remote is a directory
         is_dir = _directory_flag_for_remote(bucket, key, directory)
-        local_path_p = Path(local_path)
-
-        if is_dir:
-            # Determine destination root honoring ensure_contents_flag
-            prefix = key.rstrip("/") + "/"
-            dest_root = local_path_p if ensure_contents_flag else (local_path_p / Path(key.rstrip("/")).name)
-            _ensure_dir(dest_root)
-            if concurrent:
-                retry_obj = _build_gcs_retry(retry)
-                blob_names = [b.name for b in client.list_blobs(bucket, prefix=prefix, retry=retry_obj)]
-                if not blob_names:
-                    return
-                transfer_manager.download_many_to_path(
-                    bucket,
-                    blob_names,
-                    destination_directory=str(dest_root),
-                    blob_name_prefix=prefix,
-                    max_workers=max(1, int(max_workers)),
-                )
-            else:
-                retry_obj = _build_gcs_retry(retry)
-                for blob in client.list_blobs(bucket, prefix=prefix, retry=retry_obj):
-                    rel = blob.name[len(prefix) :]
-                    dest = dest_root / rel
-                    _ensure_dir(dest.parent)
-                    blob.download_to_filename(dest.as_posix(), retry=retry_obj)
-        else:
-            _ensure_dir(Path(local_path_p).parent)
+        
+        if not is_dir:
+            # Single file download
+            local_file = Path(local_path)
+            _ensure_dir(local_file.parent)
+            
             blob = bucket.blob(key)
-            if concurrent:
-                # Chunked concurrent download for large files
-                transfer_manager.download_chunks_concurrently(
-                    blob,
-                    str(local_path_p),
-                    max_workers=max(1, int(max_workers)),
-                )
-            else:
-                retry_obj = _build_gcs_retry(retry)
-                blob.download_to_filename(str(local_path_p), retry=retry_obj)
-
-    _with_retries(_impl, retry)
+            blob.download_to_filename(str(local_file), retry=retry_obj)
+        else:
+            # Directory download
+            prefix = key if key.endswith("/") else key + "/"
+            if key and not key.endswith("/") and not contents_only:
+                prefix = key + "/"
+            
+            blobs = _list_remote_tree(client, bucket, prefix, retry_obj)
+            
+            if not blobs:
+                return
+            
+            # Determine destination root
+            local_root = Path(local_path)
+            
+            if not ensure_contents and not contents_only:
+                # Nest under remote leaf name
+                leaf = key.rstrip("/").split("/")[-1] if key else ""
+                if leaf:
+                    local_root = local_root / leaf
+            
+            _ensure_dir(local_root)
+            
+            # Prepare blob names and destination paths
+            blob_names = []
+            for blob_name in blobs:
+                relative = blob_name[len(prefix):] if blob_name.startswith(prefix) else blob_name
+                if relative:
+                    blob_names.append(blob_name)
+            
+            if not blob_names:
+                return
+            
+            # Use transfer manager for concurrent download
+            results = _transfer_manager_module.download_many_to_path(
+                bucket,
+                blob_names,
+                destination_directory=str(local_root),
+                max_workers=max_workers
+            )
+            
+            # Check for errors
+            for name, result in zip(blob_names, results):
+                if isinstance(result, Exception):
+                    raise result
+    
+    _with_retries(_download, retry)
 
 
 def upload_to_gs(
@@ -379,83 +656,107 @@ def upload_to_gs(
     concurrent: bool = True,
     ensure_contents: bool = True,
     retry: int = 0,
-    max_workers: int = 8,
+    max_workers: int = 8
 ) -> None:
-    def _impl() -> None:
+    """Uploads a single file or a directory tree from local filesystem to GCS.
+    
+    Args:
+        local_path: Local source path.
+        remote_path: GCS destination path (gs://bucket/key).
+        directory: "auto", True, or False to indicate directory semantics.
+        concurrent: Use concurrent transfers (may be no-op).
+        ensure_contents: If True, uploads directory contents under remote_path.
+        retry: Number of retries for transient failures.
+        max_workers: Parallelism for transfer manager.
+    """
+    _require_gcs()
+    
+    def _upload():
         client = _get_storage_client()
-        from google.cloud.storage import transfer_manager  # type: ignore
-
-        local_base, local_contents = _parse_local_contents_spec(local_path)
-        bucket_name, key, remote_contents = _parse_remote_contents_spec(remote_path)
+        bucket_name, key, contents_only = _parse_remote_contents_spec(remote_path)
         bucket = client.bucket(bucket_name)
-
-        # Derive final flags
-        ensure_contents_flag = bool(ensure_contents or remote_contents or local_contents)
-
+        
+        retry_obj = _build_gcs_retry(retry)
+        
+        local_base, local_contents_only = _parse_local_contents_spec(local_path)
+        
+        # Determine if local is a directory
         is_dir = _directory_flag_for_local(local_base, directory)
-
-        if is_dir:
-            if not local_base.is_dir():
-                raise ValueError(f"Expected a directory at {local_base}")
-            dest_prefix = key.rstrip("/") + "/" if ensure_contents_flag else key.rstrip("/") + f"/{local_base.name}/"
-            if concurrent:
-                transfer_manager.upload_many_from_directory(
-                    bucket,
-                    source_directory=str(local_base),
-                    destination_directory=dest_prefix,
-                    max_workers=max(1, int(max_workers)),
-                )
-            else:
-                for path in local_base.rglob("*"):
-                    if path.is_file():
-                        rel = path.relative_to(local_base).as_posix()
-                        blob = bucket.blob(dest_prefix + rel)
-                        _ensure_dir(path.parent)
-                        retry_obj = _build_gcs_retry(retry)
-                        blob.upload_from_filename(path.as_posix(), retry=retry_obj)
-        else:
-            if not local_base.is_file():
-                raise ValueError(f"Expected a file at {local_base}")
+        
+        if not is_dir:
+            # Single file upload
             blob = bucket.blob(key)
-            retry_obj = _build_gcs_retry(retry)
-            blob.upload_from_filename(local_base.as_posix(), retry=retry_obj)
-
-    _with_retries(_impl, retry)
-
-
-def _list_remote_tree(client, bucket, prefix: str, retry_obj=None) -> Dict[str, Any]:
-    items: Dict[str, Any] = {}
-    for b in client.list_blobs(bucket, prefix=prefix, retry=retry_obj):
-        items[b.name] = b
-    return items
-
-
-def _crc32c_local(path: Path) -> Optional[str]:
-    try:
-        import google_crc32c  # type: ignore
-
-        checksum = google_crc32c.Checksum()
-        with open(path, "rb") as f:
-            for chunk in iter(lambda: f.read(1024 * 1024), b""):
-                checksum.update(chunk)
-        # google-cloud-storage uses base64-encoded crc32c; google-crc32c returns int digest
-        # The Blob.crc32c property is a base64 string; comparing that exactly requires encoding.
-        # To avoid strict dependency, return None here and fall back unless the library supports base64.
-        # As an approximation we return None if base64 conversion is unavailable.
-        try:
-            import base64
-
-            digest_int = checksum.digest()
-            # google-crc32c v1.5+ returns int; convert to 4-byte big-endian
-            if isinstance(digest_int, int):
-                b4 = digest_int.to_bytes(4, byteorder="big", signed=False)
-            else:
-                b4 = digest_int  # type: ignore[assignment]
-            return base64.b64encode(b4).decode("ascii")
-        except Exception:
-            return None
-    except Exception:
-        return None
+            blob.upload_from_filename(str(local_base), retry=retry_obj)
+        else:
+            # Directory upload
+            files_to_upload = []
+            
+            for item in local_base.rglob("*"):
+                if item.is_file():
+                    relative = item.relative_to(local_base)
+                    files_to_upload.append((str(item), str(relative)))
+            
+            if not files_to_upload:
+                return
+            
+            # Determine remote prefix
+            remote_prefix = key
+            if not ensure_contents and not contents_only and not local_contents_only:
+                # Nest under local base name
+                leaf = local_base.name
+                remote_prefix = f"{key}/{leaf}" if key else leaf
+            
+            if remote_prefix and not remote_prefix.endswith("/"):
+                remote_prefix += "/"
+            
+            # Build mapping of source files to destination blob names
+            blob_names = []
+            source_files = []
+            
+            for source_file, relative in files_to_upload:
+                blob_name = remote_prefix + str(relative).replace("\\", "/")
+                blob_names.append(blob_name)
+                source_files.append(source_file)
+            
+            # Create staging directory with proper structure
+            import tempfile
+            with tempfile.TemporaryDirectory() as staging_dir:
+                staging_path = Path(staging_dir)
+                
+                for source_file, blob_name in zip(source_files, blob_names):
+                    # Extract relative path from blob_name
+                    rel_path = blob_name[len(remote_prefix):] if blob_name.startswith(remote_prefix) else blob_name
+                    dest = staging_path / rel_path
+                    _ensure_dir(dest.parent)
+                    
+                    # Try hard link, fall back to symlink, then copy
+                    try:
+                        os.link(source_file, dest)
+                    except (OSError, NotImplementedError):
+                        try:
+                            os.symlink(source_file, dest)
+                        except (OSError, NotImplementedError):
+                            shutil.copy2(source_file, dest)
+                
+                # Prepare filenames for transfer manager
+                filenames = [str(staging_path / blob_name[len(remote_prefix):]) 
+                            for blob_name in blob_names]
+                
+                # Upload using transfer manager
+                results = _transfer_manager_module.upload_many_from_filenames(
+                    bucket,
+                    filenames,
+                    source_directory=str(staging_path),
+                    max_workers=max_workers,
+                    blob_name_prefix=remote_prefix
+                )
+                
+                # Check for errors
+                for name, result in zip(filenames, results):
+                    if isinstance(result, Exception):
+                        raise result
+    
+    _with_retries(_upload, retry)
 
 
 def sync_to_gs(
@@ -467,75 +768,104 @@ def sync_to_gs(
     delete: bool = False,
     checksum: bool = False,
     retry: int = 0,
-    max_workers: int = 8,
+    max_workers: int = 8
 ) -> None:
-    def _impl() -> None:
+    """Synchronizes a local directory or single file to GCS.
+    
+    Args:
+        local_path: Local source path.
+        remote_path: GCS destination path (gs://bucket/key).
+        directory: "auto", True, or False to indicate directory semantics.
+        concurrent: Use concurrent transfers (may be no-op).
+        ensure_contents: If True, syncs directory contents under remote_path.
+        delete: If True, removes remote blobs not present locally.
+        checksum: If True, uses CRC32C for comparison instead of size.
+        retry: Number of retries for transient failures.
+        max_workers: Parallelism for transfer manager.
+    """
+    _require_gcs()
+    
+    def _sync():
         client = _get_storage_client()
-
-        local_base, local_contents = _parse_local_contents_spec(local_path)
-        bucket_name, key, remote_contents = _parse_remote_contents_spec(remote_path)
+        bucket_name, key, contents_only = _parse_remote_contents_spec(remote_path)
         bucket = client.bucket(bucket_name)
-
-        ensure_contents_flag = bool(ensure_contents or remote_contents or local_contents)
-
-        is_dir = _directory_flag_for_local(local_base, directory)
-        if not is_dir:
-            return upload_to_gs(local_base, remote_path, directory=False, concurrent=concurrent, ensure_contents=True, retry=retry, max_workers=max_workers)
-
-        if not local_base.is_dir():
-            raise ValueError(f"Expected a directory at {local_base}")
-
-        dest_prefix = key.rstrip("/") + "/" if ensure_contents_flag else key.rstrip("/") + f"/{local_base.name}/"
-
+        
         retry_obj = _build_gcs_retry(retry)
-        remote_map = _list_remote_tree(client, bucket, dest_prefix, retry_obj=retry_obj)
-
-        to_upload: List[Path] = []
-        for path in local_base.rglob("*"):
-            if not path.is_file():
-                continue
-            rel = path.relative_to(local_base).as_posix()
-            remote_key = dest_prefix + rel
-            remote_blob = remote_map.get(remote_key)
-            if remote_blob is None:
-                to_upload.append(path)
-                continue
-            if checksum:
-                local_crc = _crc32c_local(path)
-                if local_crc and getattr(remote_blob, "crc32c", None) != local_crc:
-                    to_upload.append(path)
-                    continue
+        
+        local_base, local_contents_only = _parse_local_contents_spec(local_path)
+        
+        # Determine if local is a directory
+        is_dir = _directory_flag_for_local(local_base, directory)
+        
+        if not is_dir:
+            # Single file sync - just upload
+            blob = bucket.blob(key)
+            blob.upload_from_filename(str(local_base), retry=retry_obj)
+            return
+        
+        # Directory sync
+        local_files = {}
+        for item in local_base.rglob("*"):
+            if item.is_file():
+                relative = item.relative_to(local_base)
+                local_files[str(relative)] = item
+        
+        # Determine remote prefix
+        remote_prefix = key
+        if not ensure_contents and not contents_only and not local_contents_only:
+            leaf = local_base.name
+            remote_prefix = f"{key}/{leaf}" if key else leaf
+        
+        if remote_prefix and not remote_prefix.endswith("/"):
+            remote_prefix += "/"
+        
+        # List remote blobs
+        remote_blobs = _list_remote_tree(client, bucket, remote_prefix, retry_obj)
+        
+        # Determine files to upload
+        to_upload = []
+        
+        for relative_path, local_file in local_files.items():
+            blob_name = remote_prefix + str(relative_path).replace("\\", "/")
+            
+            if blob_name not in remote_blobs:
+                # New file
+                to_upload.append((str(local_file), blob_name))
             else:
-                try:
-                    if path.stat().st_size != int(getattr(remote_blob, "size", 0)):
-                        to_upload.append(path)
-                        continue
-                except Exception:
-                    to_upload.append(path)
-
-        def _upload_one(p: Path) -> None:
-            rel = p.relative_to(local_base).as_posix()
-            blob = bucket.blob(dest_prefix + rel)
-            blob.upload_from_filename(p.as_posix(), retry=_build_gcs_retry(retry))
-
-        if concurrent and to_upload:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, int(max_workers))) as ex:
-                list(ex.map(_upload_one, to_upload))
-        else:
-            for p in to_upload:
-                _upload_one(p)
-
+                # Check if changed
+                blob = remote_blobs[blob_name]
+                local_size = local_file.stat().st_size
+                
+                if checksum:
+                    local_crc = _crc32c_local(local_file)
+                    if local_crc and hasattr(blob, "crc32c") and blob.crc32c:
+                        if local_crc != blob.crc32c:
+                            to_upload.append((str(local_file), blob_name))
+                    elif local_size != blob.size:
+                        to_upload.append((str(local_file), blob_name))
+                else:
+                    if local_size != blob.size:
+                        to_upload.append((str(local_file), blob_name))
+        
+        # Upload changed files
+        if to_upload:
+            for local_file, blob_name in to_upload:
+                blob = bucket.blob(blob_name)
+                blob.upload_from_filename(local_file, retry=retry_obj)
+        
+        # Delete remote files not in local
         if delete:
-            local_keys = {dest_prefix + p.relative_to(local_base).as_posix() for p in local_base.rglob("*") if p.is_file()}
-            extra_remote = set(remote_map.keys()) - local_keys
-            for rk in extra_remote:
-                from google.api_core import exceptions as gexc  # type: ignore
-                try:
-                    bucket.blob(rk).delete(retry=_build_gcs_retry(retry))
-                except gexc.NotFound:
-                    continue
-
-    _with_retries(_impl, retry)
+            local_blob_names = {
+                remote_prefix + str(rel).replace("\\", "/")
+                for rel in local_files.keys()
+            }
+            
+            for blob_name in remote_blobs:
+                if blob_name not in local_blob_names:
+                    blob = bucket.blob(blob_name)
+                    blob.delete(retry=retry_obj)
+    
+    _with_retries(_sync, retry)
 
 
 def sync_from_gs(
@@ -547,78 +877,103 @@ def sync_from_gs(
     delete: bool = False,
     checksum: bool = False,
     retry: int = 0,
-    max_workers: int = 8,
+    max_workers: int = 8
 ) -> None:
-    def _impl() -> None:
+    """Synchronizes from GCS to local directory.
+    
+    Args:
+        remote_path: GCS source path (gs://bucket/key).
+        local_path: Local destination path.
+        directory: "auto", True, or False to indicate directory semantics.
+        concurrent: Use concurrent transfers (may be no-op).
+        ensure_contents: If True, syncs contents directly under local_path.
+        delete: If True, removes local files not present remotely.
+        checksum: If True, uses CRC32C for comparison instead of size.
+        retry: Number of retries for transient failures.
+        max_workers: Parallelism for transfer manager.
+    """
+    _require_gcs()
+    
+    def _sync():
         client = _get_storage_client()
-
-        bucket_name, key, remote_contents = _parse_remote_contents_spec(remote_path)
+        bucket_name, key, contents_only = _parse_remote_contents_spec(remote_path)
         bucket = client.bucket(bucket_name)
-
-        if remote_contents:
-            directory = True
-            ensure_contents_flag = True
-        else:
-            ensure_contents_flag = ensure_contents
-
-        is_dir = _directory_flag_for_remote(bucket, key, directory)
-        local_p = Path(local_path)
-
-        if not is_dir:
-            return download_from_gs(remote_path, local_p, directory=False, concurrent=concurrent, ensure_contents=True, retry=retry, max_workers=max_workers)
-
-        # Determine destination root honoring ensure_contents_flag
-        prefix = key.rstrip("/") + "/"
-        dest_root = local_p if ensure_contents_flag else (local_p / Path(key.rstrip("/")).name)
-        _ensure_dir(dest_root)
+        
         retry_obj = _build_gcs_retry(retry)
-        remote_map = _list_remote_tree(client, bucket, prefix, retry_obj=retry_obj)
-
-        def _dest_for(remote_key: str) -> Path:
-            rel = remote_key[len(prefix) :]
-            return dest_root / rel
-
-        to_download: List[Tuple[str, str]] = []  # (remote_key, local_path)
-        for rk, blob in remote_map.items():
-            dest = _dest_for(rk)
-            if dest.exists() and dest.is_file():
-                if checksum and getattr(blob, "crc32c", None):
-                    local_crc = _crc32c_local(dest)
-                    if local_crc and local_crc == blob.crc32c:
-                        continue
+        
+        # Determine if remote is a directory
+        is_dir = _directory_flag_for_remote(bucket, key, directory)
+        
+        if not is_dir:
+            # Single file sync
+            local_file = Path(local_path)
+            _ensure_dir(local_file.parent)
+            
+            blob = bucket.blob(key)
+            blob.download_to_filename(str(local_file), retry=retry_obj)
+            return
+        
+        # Directory sync
+        prefix = key if key.endswith("/") else key + "/"
+        remote_blobs = _list_remote_tree(client, bucket, prefix, retry_obj)
+        
+        # Determine local root
+        local_root = Path(local_path)
+        if not ensure_contents and not contents_only:
+            leaf = key.rstrip("/").split("/")[-1] if key else ""
+            if leaf:
+                local_root = local_root / leaf
+        
+        _ensure_dir(local_root)
+        
+        # Build mapping of remote to local
+        to_download = []
+        
+        for blob_name, blob in remote_blobs.items():
+            relative = blob_name[len(prefix):] if blob_name.startswith(prefix) else blob_name
+            if not relative:
+                continue
+            
+            local_file = local_root / relative
+            
+            if not local_file.exists():
+                to_download.append((blob_name, local_file))
+            else:
+                # Check if changed
+                local_size = local_file.stat().st_size
+                
+                if checksum:
+                    local_crc = _crc32c_local(local_file)
+                    if local_crc and hasattr(blob, "crc32c") and blob.crc32c:
+                        if local_crc != blob.crc32c:
+                            to_download.append((blob_name, local_file))
+                    elif local_size != blob.size:
+                        to_download.append((blob_name, local_file))
                 else:
-                    try:
-                        if dest.stat().st_size == int(getattr(blob, "size", 0)):
-                            continue
-                    except Exception:
-                        pass
-            _ensure_dir(dest.parent)
-            to_download.append((rk, dest.as_posix()))
-
-        def _download_one(item: Tuple[str, str]) -> None:
-            rk, lp = item
-            bucket.blob(rk).download_to_filename(lp, retry=retry_obj)
-
-        if concurrent and to_download:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, int(max_workers))) as ex:
-                list(ex.map(_download_one, to_download))
-        else:
-            for item in to_download:
-                _download_one(item)
-
+                    if local_size != blob.size:
+                        to_download.append((blob_name, local_file))
+        
+        # Download changed files
+        if to_download:
+            for blob_name, local_file in to_download:
+                _ensure_dir(local_file.parent)
+                blob = bucket.blob(blob_name)
+                blob.download_to_filename(str(local_file), retry=retry_obj)
+        
+        # Delete local files not in remote
         if delete:
-            # Remove local files not present remotely
-            remote_rel = {rk[len(prefix) : ] for rk in remote_map.keys()}
-            for path in dest_root.rglob("*"):
-                if path.is_file():
-                    rel = path.relative_to(dest_root).as_posix()
-                    if rel not in remote_rel:
-                        try:
-                            path.unlink()
-                        except Exception:
-                            pass
-
-    _with_retries(_impl, retry)
+            remote_relatives = {
+                blob_name[len(prefix):] if blob_name.startswith(prefix) else blob_name
+                for blob_name in remote_blobs.keys()
+            }
+            
+            for item in local_root.rglob("*"):
+                if item.is_file():
+                    relative = str(item.relative_to(local_root))
+                    if relative not in remote_relatives:
+                        item.unlink()
+    
+    _with_retries(_sync, retry)
 
 
 def pop_from_gs(
@@ -628,32 +983,50 @@ def pop_from_gs(
     concurrent: bool = True,
     ensure_contents: bool = True,
     retry: int = 0,
-    max_workers: int = 8,
+    max_workers: int = 8
 ) -> None:
-    def _impl() -> None:
+    """Downloads from GCS and then deletes the remote object(s).
+    
+    Args:
+        remote_path: GCS source path (gs://bucket/key).
+        local_path: Local destination path.
+        directory: "auto", True, or False to indicate directory semantics.
+        concurrent: Use concurrent transfers (may be no-op).
+        ensure_contents: If True, places files directly under local_path.
+        retry: Number of retries for transient failures.
+        max_workers: Parallelism for transfer manager.
+    """
+    # Download first
+    download_from_gs(
+        remote_path, local_path, directory, concurrent,
+        ensure_contents, retry, max_workers
+    )
+    
+    # Then delete
+    _require_gcs()
+    
+    def _delete():
         client = _get_storage_client()
-        download_from_gs(remote_path, local_path, directory=directory, concurrent=concurrent, ensure_contents=ensure_contents, retry=retry, max_workers=max_workers)
-        bucket_name, key, remote_contents = _parse_remote_contents_spec(remote_path)
+        bucket_name, key, _ = _parse_remote_contents_spec(remote_path)
         bucket = client.bucket(bucket_name)
-        # If remote specified '/.', treat as directory contents
-        if remote_contents or _directory_flag_for_remote(bucket, key, directory):
-            prefix = key.rstrip("/") + "/"
-            from google.api_core import exceptions as gexc  # type: ignore
-            retry_obj = _build_gcs_retry(retry)
-            for b in client.list_blobs(bucket, prefix=prefix, retry=retry_obj):
-                try:
-                    b.delete(retry=retry_obj)
-                except gexc.NotFound:
-                    continue
-        else:
-            from google.api_core import exceptions as gexc  # type: ignore
+        
+        retry_obj = _build_gcs_retry(retry)
+        
+        # Determine if remote is a directory
+        is_dir = _directory_flag_for_remote(bucket, key, directory)
+        
+        if not is_dir:
             blob = bucket.blob(key)
-            try:
-                blob.delete(retry=_build_gcs_retry(retry))
-            except gexc.NotFound:
-                pass
-
-    _with_retries(_impl, retry)
+            blob.delete(retry=retry_obj)
+        else:
+            # Delete all blobs under prefix
+            prefix = key if key.endswith("/") else key + "/"
+            blobs = list(bucket.list_blobs(prefix=prefix, retry=retry_obj))
+            
+            for blob in blobs:
+                blob.delete(retry=retry_obj)
+    
+    _with_retries(_delete, retry)
 
 
 def push_to_gs(
@@ -663,219 +1036,305 @@ def push_to_gs(
     concurrent: bool = True,
     ensure_contents: bool = True,
     retry: int = 0,
-    max_workers: int = 8,
+    max_workers: int = 8
 ) -> None:
-    def _impl() -> None:
-        # Parse specs to honor '/*' and '/.' semantics
-        local_base, local_contents = _parse_local_contents_spec(local_path)
-        _, _, remote_contents = _parse_remote_contents_spec(remote_path)
+    """Uploads to GCS and then deletes the local source.
+    
+    Args:
+        local_path: Local source path.
+        remote_path: GCS destination path (gs://bucket/key).
+        directory: "auto", True, or False to indicate directory semantics.
+        concurrent: Use concurrent transfers (may be no-op).
+        ensure_contents: If True, uploads directory contents under remote_path.
+        retry: Number of retries for transient failures.
+        max_workers: Parallelism for transfer manager.
+    """
+    # Upload first
+    upload_to_gs(
+        local_path, remote_path, directory, concurrent,
+        ensure_contents, retry, max_workers
+    )
+    
+    # Then delete local
+    local_base, contents_only = _parse_local_contents_spec(local_path)
+    
+    if contents_only:
+        # Only delete contents, preserve directory
+        for item in local_base.iterdir():
+            if item.is_file():
+                item.unlink()
+            elif item.is_dir():
+                shutil.rmtree(item)
+    else:
+        # Delete entire path
+        if local_base.is_file():
+            local_base.unlink()
+        elif local_base.is_dir():
+            shutil.rmtree(local_base)
 
-        upload_to_gs(local_path, remote_path, directory=directory, concurrent=concurrent, ensure_contents=ensure_contents or local_contents or remote_contents, retry=retry, max_workers=max_workers)
 
-        # Deletion semantics: if local had '/*', delete only contents, preserve directory
-        if _directory_flag_for_local(local_base, directory):
-            if local_contents:
-                try:
-                    for child in local_base.iterdir():
-                        if child.is_dir():
-                            shutil.rmtree(child, ignore_errors=True)
-                        else:
-                            with contextlib.suppress(Exception):
-                                child.unlink()
-                except Exception:
-                    pass
-            else:
-                try:
-                    shutil.rmtree(local_base, ignore_errors=True)
-                except Exception:
-                    pass
-        else:
-            try:
-                Path(local_base).unlink()
-            except Exception:
-                pass
-
-    _with_retries(_impl, retry)
-
-
-def check_exists(remote: Union[str, Sequence[str]], max_ancestors: Optional[int] = None) -> Union[bool, Dict[str, bool]]:
-    def _impl_one(path: str) -> bool:
-        client = _get_storage_client()
-        bucket_name, key, remote_contents = _parse_remote_contents_spec(path)
-        bucket = client.bucket(bucket_name)
-        retry_obj = _build_gcs_retry(1)
-        # If '/.' provided, check for any children under the directory
-        if remote_contents:
-            prefix = key.rstrip("/") + "/"
-            it = client.list_blobs(bucket, prefix=prefix, max_results=1, retry=retry_obj)
-            return any(True for _ in it)
-        else:
-            blob = bucket.blob(key)
-            if blob.exists(retry=retry_obj):
-                return True
-            prefix = key.rstrip("/") + "/"
-            it = client.list_blobs(bucket, prefix=prefix, max_results=1, retry=retry_obj)
-            return any(True for _ in it)
-
-    if isinstance(remote, str):
-        return _with_retries(lambda: _impl_one(remote), retry=0)
-
-    # List[str] case: group by bucket and ancestor to reduce calls
-    paths = list(remote)
+def check_exists_gs(
+    remote: Union[str, Sequence[str]],
+    max_ancestors: Optional[int] = None
+) -> Union[bool, Dict[str, bool]]:
+    """Existence checks for GCS paths.
+    
+    Args:
+        remote: Single GCS path or sequence of paths.
+        max_ancestors: Optional limit for grouping prefix depth.
+        
+    Returns:
+        Boolean if single string, dict mapping path to boolean if sequence.
+    """
+    _require_gcs()
+    
     client = _get_storage_client()
-
-    # Group by bucket
-    by_bucket: Dict[str, List[str]] = {}
-    for p in paths:
-        bucket, key = _parse_gs_path(p)
-        by_bucket.setdefault(bucket, []).append(key)
-
-    results: Dict[str, bool] = {p: False for p in paths}
-
-    for bucket_name, keys in by_bucket.items():
+    
+    if isinstance(remote, str):
+        # Single path check
+        bucket_name, key, contents_only = _parse_remote_contents_spec(remote)
         bucket = client.bucket(bucket_name)
-
-        # Build grouping prefixes
-        groups: Dict[str, List[str]] = {}
-        if max_ancestors is None:
-            # Use common prefix if any; fallback to top-level segments
-            def common_prefix(ss: List[str]) -> str:
-                if not ss:
-                    return ""
-                split = [s.split("/") for s in ss]
-                prefix_parts: List[str] = []
-                for parts in zip(*split):
-                    if all(part == parts[0] for part in parts):
-                        prefix_parts.append(parts[0])
-                    else:
-                        break
-                return "/".join(prefix_parts) + ("/" if prefix_parts else "")
-
-            cp = common_prefix(keys)
-            if cp:
-                groups[cp] = keys
-            else:
-                for k in keys:
-                    head = (k.split("/", 1)[0] + "/") if "/" in k else ""
-                    groups.setdefault(head, []).append(k)
+        
+        if contents_only or key.endswith("/"):
+            # Check for any children
+            prefix = key.rstrip("/") + "/" if key else ""
+            blobs = list(bucket.list_blobs(prefix=prefix, max_results=1))
+            return len(blobs) > 0
         else:
-            depth = max(0, int(max_ancestors))
-            for k in keys:
-                parts = k.split("/")
-                if depth >= len(parts):
-                    prefix = ""
+            # Check exact blob or children under key/
+            blob = bucket.blob(key)
+            if blob.exists():
+                return True
+            
+            # Check for children
+            prefix = key + "/"
+            blobs = list(bucket.list_blobs(prefix=prefix, max_results=1))
+            return len(blobs) > 0
+    else:
+        # Multiple paths - group by bucket and prefix
+        results = {}
+        
+        # Group by bucket
+        by_bucket = {}
+        for path in remote:
+            bucket_name, key, contents_only = _parse_remote_contents_spec(path)
+            if bucket_name not in by_bucket:
+                by_bucket[bucket_name] = []
+            by_bucket[bucket_name].append((path, key, contents_only))
+        
+        # Check each bucket's paths
+        for bucket_name, paths in by_bucket.items():
+            bucket = client.bucket(bucket_name)
+            
+            # For simplicity, check each path individually
+            # A more optimized implementation would group by prefix
+            for path, key, contents_only in paths:
+                if contents_only or key.endswith("/"):
+                    prefix = key.rstrip("/") + "/" if key else ""
+                    blobs = list(bucket.list_blobs(prefix=prefix, max_results=1))
+                    results[path] = len(blobs) > 0
                 else:
-                    prefix = "/".join(parts[: len(parts) - depth])
-                    if prefix:
-                        prefix += "/"
-                groups.setdefault(prefix, []).append(k)
-
-        # List blobs once per group
-            for prefix, member_keys in groups.items():
-                listed = {b.name for b in client.list_blobs(bucket, prefix=prefix, retry=_build_gcs_retry(1))}
-            for k in member_keys:
-                    # Support '/.' key membership mapping
-                    contents_only = False
-                    if k.endswith("/."):
-                        k0 = k[:-2]
-                        contents_only = True
+                    blob = bucket.blob(key)
+                    if blob.exists():
+                        results[path] = True
                     else:
-                        k0 = k
-
-                    if not contents_only and k0 in listed:
-                        results[f"gs://{bucket_name}/{k}"] = True
-                    else:
-                        # If key not present, check if any children exist
-                        if any(name.startswith(k0.rstrip("/") + "/") for name in listed):
-                            results[f"gs://{bucket_name}/{k}"] = True
-
-    return results
+                        prefix = key + "/"
+                        blobs = list(bucket.list_blobs(prefix=prefix, max_results=1))
+                        results[path] = len(blobs) > 0
+        
+        return results
 
 
-# --------------
-# Convenience IO
-# --------------
+# ============================================================================
+# Convenience I/O, listing, and deletion
+# ============================================================================
 
 def gs_read_text(remote_path: str, encoding: str = "utf-8", retry: int = 0) -> str:
-    def _impl() -> str:
+    """Downloads blob content as text.
+    
+    Args:
+        remote_path: GCS path (gs://bucket/key).
+        encoding: Text encoding.
+        retry: Number of retries for transient failures.
+        
+    Returns:
+        Blob content as string.
+    """
+    _require_gcs()
+    
+    def _read():
         client = _get_storage_client()
         bucket_name, key = _parse_gs_path(remote_path)
-        blob = client.bucket(bucket_name).blob(key)
-        return blob.download_as_text(encoding=encoding, retry=_build_gcs_retry(retry))
-
-    return _with_retries(_impl, retry)
+        bucket = client.bucket(bucket_name)
+        blob = bucket.blob(key)
+        
+        retry_obj = _build_gcs_retry(retry)
+        content = blob.download_as_bytes(retry=retry_obj)
+        return content.decode(encoding)
+    
+    return _with_retries(_read, retry)
 
 
 def gs_read_bytes(remote_path: str, retry: int = 0) -> bytes:
-    def _impl() -> bytes:
+    """Downloads blob content as bytes.
+    
+    Args:
+        remote_path: GCS path (gs://bucket/key).
+        retry: Number of retries for transient failures.
+        
+    Returns:
+        Blob content as bytes.
+    """
+    _require_gcs()
+    
+    def _read():
         client = _get_storage_client()
         bucket_name, key = _parse_gs_path(remote_path)
-        blob = client.bucket(bucket_name).blob(key)
-        return blob.download_as_bytes(retry=_build_gcs_retry(retry))
-
-    return _with_retries(_impl, retry)
+        bucket = client.bucket(bucket_name)
+        blob = bucket.blob(key)
+        
+        retry_obj = _build_gcs_retry(retry)
+        return blob.download_as_bytes(retry=retry_obj)
+    
+    return _with_retries(_read, retry)
 
 
 def gs_write_text(remote_path: str, text: str, encoding: str = "utf-8", retry: int = 0) -> None:
-    data = text.encode(encoding)
-    return gs_write_bytes(remote_path, data, content_type="text/plain; charset=" + encoding, retry=retry)
+    """Uploads text as a blob.
+    
+    Args:
+        remote_path: GCS path (gs://bucket/key).
+        text: Text content to upload.
+        encoding: Text encoding.
+        retry: Number of retries for transient failures.
+    """
+    _require_gcs()
+    
+    def _write():
+        client = _get_storage_client()
+        bucket_name, key = _parse_gs_path(remote_path)
+        bucket = client.bucket(bucket_name)
+        blob = bucket.blob(key)
+        
+        retry_obj = _build_gcs_retry(retry)
+        blob.upload_from_string(
+            text,
+            content_type=f"text/plain; charset={encoding}",
+            retry=retry_obj
+        )
+    
+    _with_retries(_write, retry)
 
 
 def gs_write_bytes(remote_path: str, data: bytes, content_type: str = "application/octet-stream", retry: int = 0) -> None:
-    def _impl() -> None:
+    """Uploads bytes as a blob.
+    
+    Args:
+        remote_path: GCS path (gs://bucket/key).
+        data: Bytes content to upload.
+        content_type: MIME content type.
+        retry: Number of retries for transient failures.
+    """
+    _require_gcs()
+    
+    def _write():
         client = _get_storage_client()
         bucket_name, key = _parse_gs_path(remote_path)
-        blob = client.bucket(bucket_name).blob(key)
-        blob.upload_from_string(data, content_type=content_type, retry=_build_gcs_retry(retry))
+        bucket = client.bucket(bucket_name)
+        blob = bucket.blob(key)
+        
+        retry_obj = _build_gcs_retry(retry)
+        blob.upload_from_string(data, content_type=content_type, retry=retry_obj)
+    
+    _with_retries(_write, retry)
 
-    _with_retries(_impl, retry)
 
-
-@contextlib.contextmanager
-def gs_open(remote_path: str, mode: str = "rb", retry: int = 0):  # type: ignore[override]
-    client = _get_storage_client()
-    bucket_name, key = _parse_gs_path(remote_path)
-    blob = client.bucket(bucket_name).blob(key)
-
+@contextmanager
+def gs_open(remote_path: str, mode: str = "rb", retry: int = 0):
+    """Context manager that opens a blob for streaming I/O.
+    
+    Args:
+        remote_path: GCS path (gs://bucket/key).
+        mode: Open mode (e.g., 'rb', 'wb', 'r', 'w').
+        retry: Number of retries for transient failures.
+        
+    Yields:
+        File-like object for blob I/O.
+    """
+    _require_gcs()
+    
     def _open():
+        client = _get_storage_client()
+        bucket_name, key = _parse_gs_path(remote_path)
+        bucket = client.bucket(bucket_name)
+        blob = bucket.blob(key)
+        
         return blob.open(mode)
-
-    f = _with_retries(_open, retry)
+    
+    file_obj = _with_retries(_open, retry)
     try:
-        yield f
+        yield file_obj
     finally:
-        with contextlib.suppress(Exception):
-            f.close()
+        file_obj.close()
 
 
-def gs_list(remote_prefix: str, recursive: bool = True, delimiter: Optional[str] = None, max_results: Optional[int] = None) -> List[str]:
+def gs_list(
+    remote_prefix: str,
+    recursive: bool = True,
+    delimiter: Optional[str] = None,
+    max_results: Optional[int] = None
+) -> List[str]:
+    """Lists blob names under a prefix.
+    
+    Args:
+        remote_prefix: GCS path prefix (gs://bucket/prefix).
+        recursive: If True, lists recursively; if False and delimiter is None, uses '/'.
+        delimiter: Optional delimiter for non-recursive listing.
+        max_results: Optional limit on number of results.
+        
+    Returns:
+        List of blob names (without bucket prefix).
+    """
+    _require_gcs()
+    
     client = _get_storage_client()
-    bucket_name, key = _parse_gs_path(remote_prefix)
+    bucket_name, prefix = _parse_gs_path(remote_prefix)
     bucket = client.bucket(bucket_name)
-    params: Dict[str, Any] = {}
+    
     if not recursive and delimiter is None:
         delimiter = "/"
-    if delimiter:
-        params["delimiter"] = delimiter
-    if max_results is not None:
-        params["max_results"] = int(max_results)
-    names: List[str] = []
-    for b in client.list_blobs(bucket, prefix=key, **params):
-        names.append(b.name)
-    return names
+    
+    blobs = bucket.list_blobs(
+        prefix=prefix,
+        delimiter=delimiter,
+        max_results=max_results
+    )
+    
+    return [blob.name for blob in blobs]
 
 
 def gs_delete(remote_path: str, recursive: bool = False) -> None:
+    """Deletes a single blob or all blobs under a prefix.
+    
+    Args:
+        remote_path: GCS path (gs://bucket/key).
+        recursive: If True or path ends with /, deletes all blobs under prefix.
+    """
+    _require_gcs()
+    
     client = _get_storage_client()
     bucket_name, key = _parse_gs_path(remote_path)
     bucket = client.bucket(bucket_name)
+    
     if recursive or key.endswith("/"):
-        prefix = key.rstrip("/") + "/"
-        for b in client.list_blobs(bucket, prefix=prefix):
-            with contextlib.suppress(Exception):
-                b.delete()
+        # Delete all blobs under prefix
+        prefix = key.rstrip("/") + "/" if key and not key.endswith("/") else key
+        blobs = list(bucket.list_blobs(prefix=prefix))
+        
+        for blob in blobs:
+            blob.delete()
     else:
-        with contextlib.suppress(Exception):
-            bucket.blob(key).delete()
-
+        # Delete single blob
+        blob = bucket.blob(key)
+        blob.delete()
 

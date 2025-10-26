@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Any, Dict
 
 from experiments import Artifact, Task, Project, SlurmExecutor
+Project.init('demo_random_files')
 
 
 @dataclass(frozen=True)
@@ -34,7 +35,7 @@ class RandomFiles(Artifact):
         # Execute the runtime script; it will discover local/remote paths and
         # the relpath from exported environment variables.
         builder.run_command(
-            f"python {Project.code_path}/examples/random_files/create_random_files.py"
+            f"python {Project.config.code_path}/examples/random_files/create_random_files.py"
         )
 
 

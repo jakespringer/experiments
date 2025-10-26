@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 from typing import Any, Dict
+import sys
+from pathlib import Path
 
 from .config import ConfigManager
 
@@ -19,7 +21,17 @@ class _ConfigView(SimpleNamespace):
     def __getattr__(self, name: str) -> Any:  # fallback to dict
         if name in self._data:
             return self._data[name]
-        return super().__getattribute__(name)
+        # Provide a helpful message pointing to the project.json to add missing keys
+        try:
+            proj_name = Project.name or "default"
+        except Exception:
+            proj_name = "default"
+        p = ConfigManager().get_project_file(proj_name)
+        full_path = str(Path(p).resolve())
+        raise AttributeError(
+            f"Project config is missing attribute '{name}'. "
+            f"Please edit {full_path} and add it under the 'config' section."
+        )
 
     def __setattr__(self, name: str, value: Any) -> None:
         if name in ("_data",):
@@ -48,7 +60,19 @@ class Project:
     @classmethod
     def init(cls, project_name: str) -> None:
         mgr = ConfigManager()
+        pfile = mgr.get_project_file(project_name)
+        created = not pfile.exists()
+        # Ensure project exists (creates project.json if missing)
         proj = mgr.ensure_project(project_name)
+        if created:
+            full_path = str(Path(pfile).resolve())
+            msg = (
+                "A new project configuration has been created.\n"
+                f"Please edit this file to add any necessary variables:\n  {full_path}\n"
+                "After updating, re-run your command."
+            )
+            print(msg, file=sys.stderr)
+            sys.exit(1)
         conf = proj.get("config", {})
         cls.name = conf.get("name", project_name)
         cls.config = _ConfigView(conf)

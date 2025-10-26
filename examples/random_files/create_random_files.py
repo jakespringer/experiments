@@ -6,6 +6,8 @@ from experiments.runlib import (
     get_project_config,
     get_relpath,
     push_to_gs,
+    check_exists_gs,
+    download_from_gs,
 )
 
 
@@ -15,7 +17,7 @@ def main() -> None:
 
     # Expect project to define local_path and remote_path roots
     local_root = os.path.join(project.local_path, rel)
-    remote_root = os.path.join(project.remote_path, rel, ".")
+    remote_root = os.path.join(project.remote_path, rel)
 
     os.makedirs(local_root, exist_ok=True)
 
@@ -34,11 +36,24 @@ def main() -> None:
         print(f"+ ls -l {local_root}")
         os.system(f"ls -l {local_root}")
         print('-'*40 + ' push_to_gs ' + '-'*40)
-        push_to_gs(os.path.join(local_root, "*"), remote_root, directory=True, concurrent=True)
+        push_to_gs(os.path.join(local_root, "*"), os.path.join(remote_root, "."), directory=True, concurrent=True)
         print('After push:')
         print(f"+ ls -l {local_root}")
         os.system(f"ls -l {local_root}")
         print('='*120)
+
+    remote_files = [
+        os.path.join(remote_root, name) for name in stories.keys()
+    ]
+    print('Exists:', check_exists_gs(remote_files))
+
+    print('Downloading:')
+    for remote_file in remote_files:
+        download_from_gs(remote_file, os.path.join(local_root, os.path.basename(remote_file)), directory=False, concurrent=False)
+    print('After download:')
+    print(f"+ ls -l {local_root}")
+    os.system(f"ls -l {local_root}")
+    print('='*120)
 
 
 if __name__ == "__main__":
