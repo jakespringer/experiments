@@ -14,8 +14,6 @@ from .config import ConfigManager
 from .project import Project
 
 
-
-
 class ExperimentCLI:
     """Command-line interface for experiments."""
     
@@ -93,12 +91,18 @@ class ExperimentCLI:
             '--slurm',
             nargs='*',
             metavar='KEY=VALUE',
-            help='Override Slurm args for all jobs (e.g., time=12:00:00 gpus=4)'
+            help='Override Slurm args for all jobs (e.g., time=12:00:00 gpus=4 exclude=node[01-04] nodelist=node05)'
         )
         launch_parser.add_argument(
             '--force-launch',
             action='store_true',
             help='Ignore running check and launch jobs anyway'
+        )
+        launch_parser.add_argument(
+            '--throttle',
+            type=int,
+            metavar='N',
+            help='Limit concurrent array tasks to N (adds %%N to --array specification)'
         )
         
         # drylaunch command
@@ -158,7 +162,13 @@ class ExperimentCLI:
             '--slurm',
             nargs='*',
             metavar='KEY=VALUE',
-            help='Override Slurm args for all jobs (no submission)'
+            help='Override Slurm args for all jobs (no submission) (e.g., time=12:00:00 gpus=4 exclude=node[01-04] nodelist=node05)'
+        )
+        drylaunch_parser.add_argument(
+            '--throttle',
+            type=int,
+            metavar='N',
+            help='Limit concurrent array tasks to N (adds %%N to --array specification)'
         )
         
         # cancel command
@@ -225,6 +235,60 @@ class ExperimentCLI:
             help='Combine tasks into N parallel jobs by running multiple tasks sequentially in each job'
         )
         
+        # printlines command
+        printlines_parser = subparsers.add_parser('printlines', help='Print one line per job to execute individual bash scripts')
+        printlines_parser.add_argument(
+            'stages',
+            nargs='*',
+            help='Stage names to run (omit for all stages)'
+        )
+        printlines_parser.add_argument(
+            '--head',
+            type=int,
+            metavar='N',
+            help='Only print the first N artifacts'
+        )
+        printlines_parser.add_argument(
+            '--tail',
+            type=int,
+            metavar='N',
+            help='Only print the last N artifacts'
+        )
+        printlines_parser.add_argument(
+            '--rerun',
+            action='store_true',
+            help='Ignore exists check and rerun all artifacts'
+        )
+        printlines_parser.add_argument(
+            '--reverse',
+            action='store_true',
+            help='Print stages in reverse order (respects dependencies)'
+        )
+        printlines_parser.add_argument(
+            '--exclude',
+            nargs='+',
+            metavar='STAGE',
+            help='Stage names to exclude from execution'
+        )
+        printlines_parser.add_argument(
+            '--artifact',
+            nargs='+',
+            metavar='ARTIFACT',
+            help='Artifact class names to include (filters by type)'
+        )
+        printlines_parser.add_argument(
+            '--jobs',
+            type=int,
+            metavar='N',
+            help='Combine tasks into N parallel jobs by running multiple tasks sequentially in each job'
+        )
+        printlines_parser.add_argument(
+            '--output-dir',
+            type=str,
+            metavar='DIR',
+            help='Directory to write job scripts (default: creates temp dir in /tmp)'
+        )
+        
         args = parser.parse_args()
         
         if not args.command:
@@ -246,6 +310,7 @@ class ExperimentCLI:
                 dependency=getattr(args, 'dependency', None),
                 slurm_overrides=getattr(args, 'slurm', None),
                 force_launch=getattr(args, 'force_launch', False),
+                throttle=getattr(args, 'throttle', None),
             )
         elif args.command == 'drylaunch':
             self.launch(
@@ -261,6 +326,7 @@ class ExperimentCLI:
                 dependency=getattr(args, 'dependency', None),
                 slurm_overrides=getattr(args, 'slurm', None),
                 force_launch=False,
+                throttle=getattr(args, 'throttle', None),
             )
         elif args.command == 'cancel':
             self.cancel(args.stages)
@@ -270,11 +336,14 @@ class ExperimentCLI:
             self.history()
         elif args.command == 'print':
             self.print_commands(args.stages, head=getattr(args, 'head', None), tail=getattr(args, 'tail', None), rerun=getattr(args, 'rerun', False), reverse=getattr(args, 'reverse', False), exclude=getattr(args, 'exclude', None), artifacts=getattr(args, 'artifact', None), jobs=getattr(args, 'jobs', None))
+        elif args.command == 'printlines':
+            self.print_lines(args.stages, head=getattr(args, 'head', None), tail=getattr(args, 'tail', None), rerun=getattr(args, 'rerun', False), reverse=getattr(args, 'reverse', False), exclude=getattr(args, 'exclude', None), artifacts=getattr(args, 'artifact', None), jobs=getattr(args, 'jobs', None), output_dir=getattr(args, 'output_dir', None))
     
-    def launch(self, stages: List[str], dry_run: bool = False, head: Optional[int] = None, tail: Optional[int] = None, rerun: bool = False, reverse: bool = False, exclude: Optional[List[str]] = None, artifacts: Optional[List[str]] = None, jobs: Optional[int] = None, dependency: Optional[List[str]] = None, slurm_overrides: Optional[List[str]] = None, force_launch: bool = False) -> None:
+    def launch(self, stages: List[str], dry_run: bool = False, head: Optional[int] = None, tail: Optional[int] = None, rerun: bool = False, reverse: bool = False, exclude: Optional[List[str]] = None, artifacts: Optional[List[str]] = None, jobs: Optional[int] = None, dependency: Optional[List[str]] = None, slurm_overrides: Optional[List[str]] = None, force_launch: bool = False, throttle: Optional[int] = None) -> None:
         """Launch experiment stages."""
         # Apply config settings to executor
         self.executor.dry_run = dry_run
+        
         # Apply CLI slurm overrides (highest priority)
         overrides: Dict[str, Any] = {}
         if slurm_overrides:
@@ -282,10 +351,27 @@ class ExperimentCLI:
                 if '=' in item:
                     k, v = item.split('=', 1)
                     overrides[k.strip()] = v.strip()
+        
+        # Handle throttle: CLI --throttle takes precedence over --slurm throttle=N
+        throttle_value = None
+        if throttle is not None:
+            # Explicit --throttle flag has highest priority
+            throttle_value = throttle
+        elif 'throttle' in overrides:
+            # Fall back to --slurm throttle=N
+            try:
+                throttle_value = int(overrides['throttle'])
+            except (ValueError, TypeError):
+                pass
+            # Remove from overrides since we handle it separately
+            overrides.pop('throttle', None)
+        
         if hasattr(self.executor, 'cli_slurm_overrides'):
             self.executor.cli_slurm_overrides = overrides
         if hasattr(self.executor, 'force_launch'):
             self.executor.force_launch = bool(force_launch)
+        if hasattr(self.executor, 'array_throttle'):
+            self.executor.array_throttle = throttle_value
         
         # Set external dependencies on the executor
         if hasattr(self.executor, 'external_dependencies'):
@@ -510,6 +596,139 @@ class ExperimentCLI:
         if reverse:
             selected = list(reversed(selected))
         print_executor.execute(selected, head=head, tail=tail, rerun=rerun, artifacts=artifacts, jobs=jobs)
+    
+    def print_lines(self, stages: List[str], head: Optional[int] = None, tail: Optional[int] = None, rerun: bool = False, reverse: bool = False, exclude: Optional[List[str]] = None, artifacts: Optional[List[str]] = None, jobs: Optional[int] = None, output_dir: Optional[str] = None) -> None:
+        """Print one line per job to execute individual bash scripts."""
+        import tempfile
+        from .executor import PrintExecutor
+        
+        # Create output directory for scripts
+        if output_dir is None:
+            # Create a temporary directory
+            output_dir = tempfile.mkdtemp(prefix='experiment_scripts_')
+        else:
+            # Use provided directory
+            output_dir_path = Path(output_dir)
+            output_dir_path.mkdir(parents=True, exist_ok=True)
+            output_dir = str(output_dir_path)
+        
+        # Create a PrintExecutor with the same paths as the SlurmExecutor
+        print_executor = PrintExecutor(
+            gs_path=self.executor.gs_path,
+            setup_command=self.executor.setup_command,
+        )
+        
+        # Copy stage information from the SlurmExecutor
+        print_executor._stages = self.executor._stages
+        
+        # Get selected stages
+        selected = stages if stages else list(self.executor._stages.keys())
+        
+        # Exclude specified stages
+        if exclude:
+            selected = [s for s in selected if s not in exclude]
+        
+        if reverse:
+            selected = list(reversed(selected))
+        
+        # Validate and normalize stages
+        selected = print_executor._validate_and_normalize_stages(selected)
+        unique_artifacts = print_executor._collect_unique_artifacts()
+        
+        if not unique_artifacts:
+            print("No artifacts registered.", file=sys.stderr)
+            return
+        
+        # Compute execution order via topological sort
+        all_tiers = print_executor.compute_topological_ordering(unique_artifacts)
+        
+        # Filter to only artifacts in selected stages
+        filtered_tiers = print_executor._filter_tiers_by_stages(all_tiers, selected)
+        
+        if not filtered_tiers:
+            print("No artifacts matched the selected stages.", file=sys.stderr)
+            return
+        
+        # Filter by artifact class names if specified
+        if artifacts:
+            filtered_tiers = print_executor._filter_tiers_by_artifact_class(filtered_tiers, artifacts)
+            
+            if not filtered_tiers:
+                print(f"No artifacts matched the specified types: {', '.join(artifacts)}", file=sys.stderr)
+                return
+        
+        # Filter out artifacts that should be skipped unless rerun flag is set
+        executable_tiers, skipped_artifacts = print_executor._filter_skipped_artifacts(filtered_tiers, rerun=rerun)
+        
+        if not executable_tiers:
+            print("All artifacts already exist. Nothing to execute.", file=sys.stderr)
+            return
+        
+        # Apply head/tail filtering if requested
+        if head is not None or tail is not None:
+            executable_tiers = print_executor._apply_head_tail_filter(executable_tiers, head, tail)
+            
+            if not executable_tiers:
+                print("No artifacts remain after filtering.", file=sys.stderr)
+                return
+        
+        # Compile tasks
+        task_tiers = [[print_executor.compile_artifact(a) for a in tier] for tier in executable_tiers]
+        
+        # Generate individual script files and print execution lines
+        task_index = 0
+        for tier in task_tiers:
+            for task in tier:
+                # Generate script content for this task
+                script_lines = []
+                script_lines.append("#!/usr/bin/env bash")
+                
+                # Add setup commands if provided
+                if print_executor.setup_command:
+                    script_lines.append(print_executor.setup_command)
+                    script_lines.append("")
+                
+                script_lines.append("set -euo pipefail")
+                script_lines.append("")
+                
+                # Export project configuration
+                try:
+                    proj_conf = self.config_manager.load_project_config(Project.name or "").get("config", {})
+                except Exception:
+                    proj_conf = {}
+                proj_conf_str = json.dumps(proj_conf, separators=(",", ":"))
+                from .executor import dquote
+                script_lines.append(f"export EXPERIMENTS_PROJECT_CONF={dquote(proj_conf_str)}")
+                script_lines.append("")
+                
+                # Export per-task experiment config
+                if task.artifact is not None:
+                    from .executor import _artifact_experiment_conf, _safe_json_dumps
+                    exp_conf = _artifact_experiment_conf(task.artifact)
+                    exp_conf_str = _safe_json_dumps(exp_conf)
+                    script_lines.append(f"export EXPERIMENTS_EXPERIMENT_CONF={dquote(exp_conf_str)}")
+                
+                # Add task commands
+                for block in task.blocks:
+                    command = block.execute()
+                    if command:
+                        script_lines.append(command)
+                
+                # Write script to file
+                script_filename = f"job_{task_index:04d}.sh"
+                script_path = Path(output_dir) / script_filename
+                
+                with open(script_path, 'w') as f:
+                    f.write("\n".join(script_lines))
+                    f.write("\n")
+                
+                # Make script executable
+                script_path.chmod(0o755)
+                
+                # Print execution line to stdout
+                print(f"bash {script_path}")
+                
+                task_index += 1
 
 
 def auto_cli(executor: SlurmExecutor) -> None:

@@ -37,10 +37,11 @@ class ConfigManager:
                 "log_directory": str(self.logs_dir),
                 "default_partition": "general",
                 # Partition-specific defaults; users may customize
+                # Use "*" as a wildcard to set defaults for all partitions
+                # Specific partition configs override the "*" defaults
                 "default_slurm_args": {
-                    "general": {"time": "2-00:00:00", "cpus": 1, "requeue": False},
-                    "array": {"time": "2-00:00:00", "cpus": 4, "requeue": True},
-                    "cpu": {"time": "1-00:00:00", "cpus": 1, "requeue": False},
+                    "*": {"time": "2-00:00:00", "cpus": 1, "requeue": False},
+                    "array": {"cpus": 4, "requeue": True},
                 },
                 # Defaults applied when initializing a new project.json
                 # "{project_name}" in values will be replaced on init

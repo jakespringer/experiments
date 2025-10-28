@@ -1182,6 +1182,12 @@ class PrintExecutor(Executor):
         """Print all shell commands that would be executed."""
         # Print bash safety header for proper error handling
         print("#!/usr/bin/env bash")
+
+        # Run setup commands if provided
+        if self.setup_command:
+            print(self.setup_command)
+            print()
+            
         print("set -euo pipefail")
         print()
         
@@ -1194,11 +1200,6 @@ class PrintExecutor(Executor):
         proj_conf_str = _json.dumps(proj_conf, separators=(",", ":"))
         print(f"export EXPERIMENTS_PROJECT_CONF={dquote(proj_conf_str)}")
         print()
-
-        # Run setup commands if provided
-        if self.setup_command:
-            print(self.setup_command)
-            print()
         
         for tier in tiers:
             for task in tier:
@@ -1259,6 +1260,7 @@ class SlurmExecutor(Executor):
         self.external_dependencies: List[str] = []  # External job IDs to depend on
         self.cli_slurm_overrides: Dict[str, Any] = {}  # Highest-priority overrides from CLI
         self.force_launch: bool = False
+        self.array_throttle: int | None = None  # Limit concurrent array tasks (e.g., %10 in --array=0-99%10)
         self._active_jobs: Set[tuple] = set()
         self._launched_map: Dict[str, Any] = {}
         self._global_config: Dict[str, Any] = global_conf
@@ -1611,6 +1613,8 @@ class SlurmExecutor(Executor):
         'mem', 'mem_per_cpu',
         # GPU resources
         'gpus', 'gres', 'constraint',
+        # Node selection/exclusion
+        'exclude', 'nodelist',
         # Job control
         'requeue', 'signal', 'open_mode',
         # Email notifications
@@ -1699,17 +1703,30 @@ class SlurmExecutor(Executor):
         # Determine partition
         partition = reqs.get('partition', config.get('partition', default_partition))
         
-        # Apply partition-specific defaults from global
+        # Apply wildcard defaults from global config first (lowest priority)
+        if isinstance(global_defaults, dict) and "*" in global_defaults:
+            wildcard_defaults = global_defaults.get("*", {})
+            if isinstance(wildcard_defaults, dict):
+                config.update(wildcard_defaults)
+        
+        # Apply partition-specific defaults from global (overrides wildcard)
         if isinstance(global_defaults, dict) and partition in global_defaults:
             part_defaults = global_defaults.get(partition, {})
             if isinstance(part_defaults, dict):
                 config.update(part_defaults)
 
-        # Apply project-level overrides
+        # Apply project-level wildcard overrides
+        if isinstance(project_overrides, dict) and "*" in project_overrides:
+            proj_wildcard = project_overrides.get("*", {})
+            if isinstance(proj_wildcard, dict):
+                config.update(proj_wildcard)
+        
+        # Apply project-level partition-specific overrides (overrides project wildcard)
         if isinstance(project_overrides, dict):
             if partition in project_overrides and isinstance(project_overrides[partition], dict):
                 config.update(project_overrides[partition])
             else:
+                # Apply flat key-value pairs as global overrides
                 for k, v in project_overrides.items():
                     if isinstance(v, (str, int, float, bool)):
                         config[k] = v
@@ -1910,6 +1927,11 @@ class SlurmExecutor(Executor):
         # Support constraint for specific hardware
         if 'constraint' in config:
             lines.append(f"#SBATCH --constraint={config['constraint']}")
+        # Node selection/exclusion
+        if 'exclude' in config:
+            lines.append(f"#SBATCH --exclude={config['exclude']}")
+        if 'nodelist' in config:
+            lines.append(f"#SBATCH --nodelist={config['nodelist']}")
         
         # Job control flags
         if config.get('requeue', False):
@@ -1931,7 +1953,12 @@ class SlurmExecutor(Executor):
             max_index = jobs_limit - 1
         else:
             max_index = len(tasks) - 1
-        lines.append(f"#SBATCH --array=0-{max_index}")
+        
+        # Add throttle if specified (limits concurrent array tasks)
+        array_spec = f"0-{max_index}"
+        if self.array_throttle is not None and self.array_throttle > 0:
+            array_spec += f"%{self.array_throttle}"
+        lines.append(f"#SBATCH --array={array_spec}")
         
         return lines
 
@@ -1942,15 +1969,15 @@ class SlurmExecutor(Executor):
             tier: List of tasks to execute
             jobs_limit: If specified, combine tasks to create this many array indices
         """
-        lines = [
-            "set -euo pipefail",
-        ]
-        
+        lines = []
+
         # Add setup commands if provided
         if self.setup_command:
             lines.append("")
             lines.append(self.setup_command)
             lines.append("")
+
+        lines.append("set -euo pipefail")
         
         # Export project configuration for all tasks
         try:
