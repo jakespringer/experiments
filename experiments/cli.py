@@ -827,11 +827,32 @@ class ExperimentCLI:
         if exists_only:
             unique_artifacts = [a for a in unique_artifacts if a.exists]
         
+        # Import Artifact for type checking
+        from .artifact import Artifact as ArtifactBase, ArtifactSet
+        
         # Helper function to safely convert values to JSON
         def safe_json_value(value: Any) -> Any:
-            """Convert value to JSON-safe format, return None if not convertible."""
+            """Convert value to JSON-safe format, return None if not convertible.
+            
+            For Artifact instances, returns "ArtifactClassName(hash)" format.
+            For ArtifactSet, recursively processes each artifact.
+            """
             if value is None or isinstance(value, (str, int, float, bool)):
                 return value
+            if isinstance(value, ArtifactBase):
+                # Format as ClassName(hash)
+                try:
+                    artifact_class = value.__class__.__name__
+                    artifact_hash = value.get_hash()
+                    return f"{artifact_class}({artifact_hash})"
+                except:
+                    return None
+            if isinstance(value, ArtifactSet):
+                # Process each artifact in the set
+                try:
+                    return [safe_json_value(item) for item in value]
+                except:
+                    return None
             if isinstance(value, (list, tuple)):
                 try:
                     return [safe_json_value(v) for v in value]
@@ -857,6 +878,7 @@ class ExperimentCLI:
             artifact_dict = {
                 'stage': artifact_to_stages.get(artifact_id, []),
                 'artifact_type': artifact.__class__.__name__,
+                'hash': artifact.get_hash(),
             }
             
             # Get data from as_dict()
