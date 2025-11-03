@@ -104,6 +104,12 @@ class ExperimentCLI:
             metavar='N',
             help='Limit concurrent array tasks to N (adds %%N to --array specification)'
         )
+        launch_parser.add_argument(
+            '--splitjobs',
+            type=int,
+            metavar='N',
+            help='Split large array submissions into multiple sbatch calls with at most N indices per submission'
+        )
         
         # drylaunch command
         drylaunch_parser = subparsers.add_parser('drylaunch', help='Dry run: show what would be launched')
@@ -169,6 +175,12 @@ class ExperimentCLI:
             type=int,
             metavar='N',
             help='Limit concurrent array tasks to N (adds %%N to --array specification)'
+        )
+        drylaunch_parser.add_argument(
+            '--splitjobs',
+            type=int,
+            metavar='N',
+            help='Split large array submissions into multiple sbatch calls with at most N indices per submission'
         )
         
         # cancel command
@@ -289,6 +301,32 @@ class ExperimentCLI:
             help='Directory to write job scripts (default: creates temp dir in /tmp)'
         )
         
+        # export command
+        export_parser = subparsers.add_parser('export', help='Export project and artifact information to JSON')
+        export_parser.add_argument(
+            'stages',
+            nargs='*',
+            help='Stage names to export (omit for all stages)'
+        )
+        export_parser.add_argument(
+            '--artifact',
+            nargs='+',
+            metavar='ARTIFACT',
+            help='Artifact class names to include (filters by type)'
+        )
+        export_parser.add_argument(
+            '--exists',
+            action='store_true',
+            help='Only export artifacts that exist'
+        )
+        export_parser.add_argument(
+            '-f', '--file',
+            type=str,
+            required=True,
+            metavar='FILE',
+            help='Output JSON file path'
+        )
+        
         args = parser.parse_args()
         
         if not args.command:
@@ -311,6 +349,7 @@ class ExperimentCLI:
                 slurm_overrides=getattr(args, 'slurm', None),
                 force_launch=getattr(args, 'force_launch', False),
                 throttle=getattr(args, 'throttle', None),
+                split_jobs=getattr(args, 'splitjobs', None),
             )
         elif args.command == 'drylaunch':
             self.launch(
@@ -327,6 +366,7 @@ class ExperimentCLI:
                 slurm_overrides=getattr(args, 'slurm', None),
                 force_launch=False,
                 throttle=getattr(args, 'throttle', None),
+                split_jobs=getattr(args, 'splitjobs', None),
             )
         elif args.command == 'cancel':
             self.cancel(args.stages)
@@ -338,8 +378,10 @@ class ExperimentCLI:
             self.print_commands(args.stages, head=getattr(args, 'head', None), tail=getattr(args, 'tail', None), rerun=getattr(args, 'rerun', False), reverse=getattr(args, 'reverse', False), exclude=getattr(args, 'exclude', None), artifacts=getattr(args, 'artifact', None), jobs=getattr(args, 'jobs', None))
         elif args.command == 'printlines':
             self.print_lines(args.stages, head=getattr(args, 'head', None), tail=getattr(args, 'tail', None), rerun=getattr(args, 'rerun', False), reverse=getattr(args, 'reverse', False), exclude=getattr(args, 'exclude', None), artifacts=getattr(args, 'artifact', None), jobs=getattr(args, 'jobs', None), output_dir=getattr(args, 'output_dir', None))
+        elif args.command == 'export':
+            self.export(args.stages, artifacts=getattr(args, 'artifact', None), exists_only=getattr(args, 'exists', False), output_file=args.file)
     
-    def launch(self, stages: List[str], dry_run: bool = False, head: Optional[int] = None, tail: Optional[int] = None, rerun: bool = False, reverse: bool = False, exclude: Optional[List[str]] = None, artifacts: Optional[List[str]] = None, jobs: Optional[int] = None, dependency: Optional[List[str]] = None, slurm_overrides: Optional[List[str]] = None, force_launch: bool = False, throttle: Optional[int] = None) -> None:
+    def launch(self, stages: List[str], dry_run: bool = False, head: Optional[int] = None, tail: Optional[int] = None, rerun: bool = False, reverse: bool = False, exclude: Optional[List[str]] = None, artifacts: Optional[List[str]] = None, jobs: Optional[int] = None, dependency: Optional[List[str]] = None, slurm_overrides: Optional[List[str]] = None, force_launch: bool = False, throttle: Optional[int] = None, split_jobs: Optional[int] = None) -> None:
         """Launch experiment stages."""
         # Apply config settings to executor
         self.executor.dry_run = dry_run
@@ -372,6 +414,9 @@ class ExperimentCLI:
             self.executor.force_launch = bool(force_launch)
         if hasattr(self.executor, 'array_throttle'):
             self.executor.array_throttle = throttle_value
+        # Set split_jobs on the executor
+        if hasattr(self.executor, 'split_jobs'):
+            self.executor.split_jobs = split_jobs
         
         # Set external dependencies on the executor
         if hasattr(self.executor, 'external_dependencies'):
@@ -729,6 +774,149 @@ class ExperimentCLI:
                 print(f"bash {script_path}")
                 
                 task_index += 1
+    
+    def export(self, stages: List[str], artifacts: Optional[List[str]] = None, exists_only: bool = False, output_file: str = None) -> None:
+        """Export project configuration and artifacts to JSON file.
+        
+        Args:
+            stages: List of stage names to export (empty for all)
+            artifacts: Optional list of artifact class names to filter by
+            exists_only: If True, only export artifacts that exist
+            output_file: Path to output JSON file
+        """
+        if not output_file:
+            print("Error: Output file is required", file=sys.stderr)
+            sys.exit(1)
+        
+        # Determine which stages to export
+        selected_stages = stages if stages else list(self.executor._stages.keys())
+        
+        # Build artifact-to-stages mapping
+        artifact_to_stages: Dict[int, List[str]] = {}
+        for stage_name, stage_artifacts in self.executor._stages.items():
+            if stage_name not in selected_stages:
+                continue
+            for artifact in stage_artifacts:
+                artifact_id = id(artifact)
+                if artifact_id not in artifact_to_stages:
+                    artifact_to_stages[artifact_id] = []
+                artifact_to_stages[artifact_id].append(stage_name)
+        
+        # Collect unique artifacts
+        seen_ids = set()
+        unique_artifacts = []
+        for stage_name in selected_stages:
+            if stage_name not in self.executor._stages:
+                print(f"Warning: Unknown stage '{stage_name}'", file=sys.stderr)
+                continue
+            for artifact in self.executor._stages[stage_name]:
+                artifact_id = id(artifact)
+                if artifact_id not in seen_ids:
+                    seen_ids.add(artifact_id)
+                    unique_artifacts.append(artifact)
+        
+        # Filter by artifact class if specified
+        if artifacts:
+            artifact_class_set = set(artifacts)
+            unique_artifacts = [
+                a for a in unique_artifacts
+                if a.__class__.__name__ in artifact_class_set
+            ]
+        
+        # Filter by exists if specified
+        if exists_only:
+            unique_artifacts = [a for a in unique_artifacts if a.exists]
+        
+        # Helper function to safely convert values to JSON
+        def safe_json_value(value: Any) -> Any:
+            """Convert value to JSON-safe format, return None if not convertible."""
+            if value is None or isinstance(value, (str, int, float, bool)):
+                return value
+            if isinstance(value, (list, tuple)):
+                try:
+                    return [safe_json_value(v) for v in value]
+                except:
+                    return None
+            if isinstance(value, dict):
+                try:
+                    return {k: safe_json_value(v) for k, v in value.items()}
+                except:
+                    return None
+            if isinstance(value, Path):
+                return str(value)
+            # For other types, try str() conversion
+            try:
+                return str(value)
+            except:
+                return None
+        
+        # Export artifacts
+        exported_artifacts = []
+        for artifact in unique_artifacts:
+            artifact_id = id(artifact)
+            artifact_dict = {
+                'stage': artifact_to_stages.get(artifact_id, []),
+                'artifact_type': artifact.__class__.__name__,
+            }
+            
+            # Get data from as_dict()
+            try:
+                as_dict_data = artifact.as_dict()
+                for key, value in as_dict_data.items():
+                    artifact_dict[key] = safe_json_value(value)
+            except Exception as e:
+                artifact_dict['_as_dict_error'] = str(e)
+            
+            # Get @property attributes
+            for attr_name in dir(artifact.__class__):
+                try:
+                    attr_value = getattr(artifact.__class__, attr_name)
+                    if isinstance(attr_value, property):
+                        # Try to get the property value
+                        try:
+                            prop_value = getattr(artifact, attr_name)
+                            artifact_dict[attr_name] = safe_json_value(prop_value)
+                        except Exception:
+                            artifact_dict[attr_name] = None
+                except:
+                    pass
+            
+            exported_artifacts.append(artifact_dict)
+        
+        # Build export data
+        export_data = {
+            'project_config': {},
+            'global_config': {},
+            'artifacts': exported_artifacts
+        }
+        
+        # Get project config
+        if Project.name:
+            try:
+                proj_conf = self.config_manager.load_project_config(Project.name).get('config', {})
+                export_data['project_config'] = safe_json_value(proj_conf)
+            except Exception:
+                pass
+        
+        # Get global config
+        try:
+            export_data['global_config'] = safe_json_value(self.config)
+        except Exception:
+            pass
+        
+        # Write to file
+        output_path = Path(output_file)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        with open(output_path, 'w') as f:
+            json.dump(export_data, f, indent=2)
+        
+        print(f"Exported {len(exported_artifacts)} artifact(s) to {output_file}", file=sys.stderr)
+        if artifacts:
+            print(f"  Filtered by artifact types: {', '.join(artifacts)}", file=sys.stderr)
+        if exists_only:
+            print(f"  Filtered to only existing artifacts", file=sys.stderr)
+        print(f"  Stages: {', '.join(selected_stages)}", file=sys.stderr)
 
 
 def auto_cli(executor: SlurmExecutor) -> None:

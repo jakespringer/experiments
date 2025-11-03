@@ -158,13 +158,13 @@ class Task:
         """Add a command execution block to this task."""
         self.blocks.append(CommandTaskBlock(command, vargs, kwargs, vformat, kwformat, flagformat))
 
-    def upload_to_gs(self, path: str, gs_path: str, directory: bool = False, contents: bool | None = True) -> None:
+    def upload_to_gs(self, path: str, gs_path: str, directory: bool = False, contents: bool | None = True, no_fail: bool = False) -> None:
         """Add a Google Cloud Storage upload block to this task."""
-        self.blocks.append(UploadToGSTaskBlock(path, gs_path, directory=directory, contents=contents))
+        self.blocks.append(UploadToGSTaskBlock(path, gs_path, directory=directory, contents=contents, no_fail=no_fail))
 
-    def download_from_gs(self, gs_path: str, path: str, directory: bool = False, skip_existing: bool = True, contents: bool | None = True) -> None:
+    def download_from_gs(self, gs_path: str, path: str, directory: bool = False, skip_existing: bool = True, contents: bool | None = True, no_fail: bool = False) -> None:
         """Add a Google Cloud Storage download block to this task."""
-        self.blocks.append(DownloadFromGSTaskBlock(gs_path, path, directory=directory, skip_existing=skip_existing, contents=contents))
+        self.blocks.append(DownloadFromGSTaskBlock(gs_path, path, directory=directory, skip_existing=skip_existing, contents=contents, no_fail=no_fail))
 
     def download(self, url: str, local_path: str, skip_existing: bool = True) -> None:
         """Add a web URL download block to this task."""
@@ -178,13 +178,13 @@ class Task:
         """Add a Hugging Face model download block to this task."""
         self.blocks.append(DownloadHFModelTaskBlock(model_name, local_dir, skip_existing=skip_existing))
 
-    def rsync_to_gs(self, path: str, gs_path: str, delete: bool = False, checksum: bool = False, contents: bool | None = True, check_exists: bool = False) -> None:
+    def rsync_to_gs(self, path: str, gs_path: str, delete: bool = False, checksum: bool = False, contents: bool | None = True, check_exists: bool = False, no_fail: bool = False) -> None:
         """Add a Google Cloud Storage rsync upload block to this task."""
-        self.blocks.append(RsyncToGSTaskBlock(path, gs_path, delete=delete, checksum=checksum, contents=contents, check_exists=check_exists))
+        self.blocks.append(RsyncToGSTaskBlock(path, gs_path, delete=delete, checksum=checksum, contents=contents, check_exists=check_exists, no_fail=no_fail))
 
-    def rsync_from_gs(self, gs_path: str, path: str, delete: bool = False, checksum: bool = False, skip_existing: bool = True, contents: bool | None = True, check_exists: bool = False) -> None:
+    def rsync_from_gs(self, gs_path: str, path: str, delete: bool = False, checksum: bool = False, skip_existing: bool = True, contents: bool | None = True, check_exists: bool = False, no_fail: bool = False) -> None:
         """Add a Google Cloud Storage rsync download block to this task."""
-        self.blocks.append(RsyncFromGSTaskBlock(gs_path, path, delete=delete, checksum=checksum, skip_existing=skip_existing, contents=contents, check_exists=check_exists))
+        self.blocks.append(RsyncFromGSTaskBlock(gs_path, path, delete=delete, checksum=checksum, skip_existing=skip_existing, contents=contents, check_exists=check_exists, no_fail=no_fail))
 
     def set_env(self, name: str, value: str, from_command: bool = False) -> None:
         """Add an environment variable export block to this task.
@@ -302,11 +302,13 @@ class UploadToGSTaskBlock(TaskBlock):
         gs_path: str,
         directory: bool = False,
         contents: bool | None = True,
+        no_fail: bool = False,
     ) -> None:
         self.path = path
         self.gs_path = gs_path  # Should be gs://bucket/path format
         self.directory = directory
         self.contents = contents  # If True, add trailing slashes; if False, remove; if None, leave
+        self.no_fail = no_fail
     
     def execute(self) -> str:
         """Generate a locked gsutil upload command."""
@@ -334,7 +336,10 @@ class UploadToGSTaskBlock(TaskBlock):
             gsutil_cmd = f"gsutil cp {dquote(source_path)} {dquote(dest_path)}"
 
         # Wrap in an exclusive file lock to prevent race conditions
-        return f"flock -x {dquote(lockfile)} -c {dquote(gsutil_cmd)}"
+        cmd = f"flock -x {dquote(lockfile)} -c {dquote(gsutil_cmd)}"
+        if self.no_fail:
+            return f"{cmd} || true"
+        return cmd
 
 
 class DownloadFromGSTaskBlock(TaskBlock):
@@ -347,12 +352,14 @@ class DownloadFromGSTaskBlock(TaskBlock):
         directory: bool = False,
         skip_existing: bool = True,
         contents: bool | None = True,
+        no_fail: bool = False,
     ) -> None:
         self.gs_path = gs_path  # Should be gs://bucket/path format
         self.path = path  # Local destination path
         self.directory = directory
         self.skip_existing = skip_existing
         self.contents = contents  # If True, add trailing slashes; if False, remove; if None, leave
+        self.no_fail = no_fail
 
     def execute(self) -> str:
         """Generate a locked gsutil download command."""
@@ -401,6 +408,8 @@ class DownloadFromGSTaskBlock(TaskBlock):
         else:
             locked_cmd = f"flock -x {dquote(lockfile)} -c {dquote(inner_cmd)}"
         
+        if self.no_fail:
+            return f"{locked_cmd} || true"
         return locked_cmd
 
 
@@ -503,6 +512,7 @@ class RsyncToGSTaskBlock(TaskBlock):
         checksum: bool = False,
         contents: bool | None = None,
         check_exists: bool = False,
+        no_fail: bool = False,
     ) -> None:
         self.path = path
         self.gs_path = gs_path  # Should be gs://bucket/path format
@@ -510,6 +520,7 @@ class RsyncToGSTaskBlock(TaskBlock):
         self.checksum = checksum  # If True, use checksum comparison instead of mtime
         self.contents = contents  # If True, add trailing slashes; if False, remove them; if None, leave as-is
         self.check_exists = check_exists  # If True, only rsync if remote path exists
+        self.no_fail = no_fail
     
     def execute(self) -> str:
         """Generate a locked gsutil rsync command."""
@@ -565,6 +576,8 @@ class RsyncToGSTaskBlock(TaskBlock):
         else:
             locked_cmd = f"flock -x {dquote(lockfile)} -c {dquote(inner_cmd)}"
         
+        if self.no_fail:
+            return f"{locked_cmd} || true"
         return locked_cmd
 
 
@@ -580,6 +593,7 @@ class RsyncFromGSTaskBlock(TaskBlock):
         skip_existing: bool = True,
         contents: bool | None = None,
         check_exists: bool = False,
+        no_fail: bool = False,
     ) -> None:
         self.gs_path = gs_path  # Should be gs://bucket/path format
         self.path = path  # Local destination path
@@ -588,6 +602,7 @@ class RsyncFromGSTaskBlock(TaskBlock):
         self.skip_existing = skip_existing
         self.contents = contents  # If True, add trailing slashes; if False, remove them; if None, leave as-is
         self.check_exists = check_exists  # If True, only rsync if remote path exists
+        self.no_fail = no_fail
 
     def execute(self) -> str:
         """Generate a locked gsutil rsync command."""
@@ -649,13 +664,16 @@ class RsyncFromGSTaskBlock(TaskBlock):
         
         # Add appropriate skip message based on what checks are enabled
         if self.skip_existing and self.check_exists:
-            return f"{locked_cmd} || echo \"Skipping sync (path exists or remote unavailable)\""
+            cmd = f"{locked_cmd} || echo \"Skipping sync (path exists or remote unavailable)\""
         elif self.skip_existing:
-            return f"{locked_cmd} || echo \"Skipping sync, {self.path} already exists\""
+            cmd = f"{locked_cmd} || echo \"Skipping sync, {self.path} already exists\""
         elif self.check_exists:
-            return f"{locked_cmd} || echo \"Skipping rsync, remote path {source_path} does not exist\""
+            cmd = f"{locked_cmd} || echo \"Skipping rsync, remote path {source_path} does not exist\""
         else:
-            return locked_cmd
+            cmd = locked_cmd
+        if self.no_fail:
+            return f"{cmd} || true"
+        return cmd
 
 
 class SetEnvTaskBlock(TaskBlock):
@@ -1264,6 +1282,7 @@ class SlurmExecutor(Executor):
         self._active_jobs: Set[tuple] = set()
         self._launched_map: Dict[str, Any] = {}
         self._global_config: Dict[str, Any] = global_conf
+        self.split_jobs: int | None = None  # If set, split large arrays into multiple sbatch submissions
 
     def auto_cli(self) -> None:
         """Launch the CLI interface for this executor."""
@@ -1303,7 +1322,14 @@ class SlurmExecutor(Executor):
                 if not self.force_launch:
                     _filtered = [t for t in _tasks if self._should_launch_task(t)]
                 if _filtered:
-                    total_groups += 1
+                    # Count potential split chunks
+                    m = len(_filtered)
+                    if jobs is not None and jobs > 0 and jobs < len(_filtered):
+                        m = jobs
+                    if self.split_jobs is not None and self.split_jobs > 0 and m > self.split_jobs:
+                        total_groups += (m + self.split_jobs - 1) // self.split_jobs
+                    else:
+                        total_groups += 1
 
         progress = _Progress(total=2 + total_groups, desc="Preparing launch")
 
@@ -1426,115 +1452,135 @@ class SlurmExecutor(Executor):
             if progress is not None:
                 progress.set(f"Submitting tier {tier_index} group {group_index + 1}/{len(task_groups)}")
             
-            # Generate the sbatch script
-            sbatch_header = self._build_sbatch_header(
-                job_name,
-                tasks,
-                slurm_config,
-                dependency_job_ids,
-                jobs_limit=jobs,
-            )
-            script_body = self._build_script_body(tasks, jobs_limit=jobs)
-            
-            # Write script to temporary file
-            script_path = self._write_script(tier_index, group_index, sbatch_header, script_body)
-            
-            # Submit the job (or fake it in dry run mode)
-            job_id = self._submit_sbatch_script(script_path)
-            if progress is not None:
-                progress.advance(1)
-            
-            # Map all artifacts in this group to this job ID
-            for task in tasks:
-                if task.artifact is not None:
-                    new_mappings[id(task.artifact)] = job_id
-            
-            # Extract log file from header
-            log_file = None
-            for line in sbatch_header:
-                if line.startswith("#SBATCH --output="):
-                    log_file = line.split("=", 1)[1]
-                    break
-            
-            # Collect artifact class names and check existence
-            artifact_classes = [
-                task.artifact.__class__.__name__ 
-                for task in tasks 
-                if task.artifact is not None
-            ]
-            
-            # Count how many tasks are complete vs remaining
-            num_complete = sum(
-                1 for task in tasks 
-                if task.artifact is not None and task.artifact.exists
-            )
-            num_remaining = len(tasks) - num_complete
-            
-            # Determine which stage this group belongs to
-            group_stage = self._determine_group_stage(tasks, stage_names)
-            
-            # Build job info
-            job_info = {
-                'job_id': job_id,
-                'job_name': job_name,
-                'tier': tier_index,
-                'group': group_index,
-                'stage': group_stage,
-                'num_tasks': len(tasks),
-                'num_complete': num_complete,
-                'num_remaining': num_remaining,
-                'artifact_classes': artifact_classes,
-                'config': slurm_config,
-                'dependencies': list(dependency_job_ids),
-                'script_path': script_path,
-                'log_file': log_file,
-                'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            }
-            
-            # Store job info for dry run summary
-            if self.dry_run:
-                self._dry_run_jobs.append(job_info)
-            
-            # Save job info to persistent storage (per-project)
-            if self.project and not self.dry_run and group_stage:
-                ConfigManager().save_job_info(self.project, group_stage, job_info)
+            # Determine if we need to split this submission into multiple sbatch calls
+            m = len(tasks)
+            if jobs is not None and jobs > 0 and jobs < len(tasks):
+                m = jobs
+            do_split = self.split_jobs is not None and self.split_jobs > 0 and m > self.split_jobs
 
-            # Record relpath -> {job_id, array_index} mappings for launched tasks
-            if not self.dry_run:
-                # Determine array index mapping for each task
-                if jobs is not None and jobs > 0 and jobs < len(tasks):
-                    # Round-robin assignment used in _build_script_body
-                    for idx, task in enumerate(tasks):
-                        if task.artifact is None:
-                            continue
-                        array_index = idx % jobs
-                        self._launched_map[task.artifact.relpath] = {
-                            'job_id': job_id,
-                            'array_index': array_index,
-                        }
-                else:
-                    for idx, task in enumerate(tasks):
-                        if task.artifact is None:
-                            continue
-                        self._launched_map[task.artifact.relpath] = {
-                            'job_id': job_id,
-                            'array_index': idx,
-                        }
-            
-            # Print brief summary (not in dry run mode)
-            if not self.dry_run:
-                # Get unique artifact types
-                artifact_types = sorted(set(artifact_classes))
-                artifact_summary = ', '.join(artifact_types) if artifact_types else 'N/A'
-                
-                stage_str = f" [{group_stage}]" if group_stage else ""
-                print(f"✓ Submitted job {job_id}: {job_name}{stage_str}", file=sys.stderr)
-                print(f"  Tasks: {len(tasks)}, Artifacts: {artifact_summary}", file=sys.stderr)
-                print(f"  Config: partition={slurm_config.get('partition', 'N/A')}, "
-                      f"cpus={slurm_config.get('cpus', 'N/A')}, "
-                      f"gpus={slurm_config.get('gpus', 'N/A')}, "
-                      f"time={slurm_config.get('time', 'N/A')}", file=sys.stderr)
-                print(file=sys.stderr)
+            if do_split:
+                num_scripts = (m + self.split_jobs - 1) // self.split_jobs  # type: ignore[arg-type]
+                chunk_size = (len(tasks) + num_scripts - 1) // num_scripts
+                # Create task chunks
+                task_chunks: List[List[Task]] = [tasks[i:i+chunk_size] for i in range(0, len(tasks), chunk_size)]
+            else:
+                task_chunks = [tasks]
+
+            for part_idx, tasks_chunk in enumerate(task_chunks):
+                # Adjust jobs_limit per chunk if splitting and jobs specified
+                local_jobs_limit = jobs
+                if do_split and jobs is not None and jobs > 0:
+                    local_jobs_limit = min(jobs, self.split_jobs)  # type: ignore[arg-type]
+
+                part_job_name = job_name
+                if len(task_chunks) > 1:
+                    part_job_name = f"{job_name}-part{part_idx}"
+
+                # Generate the sbatch script for this chunk
+                sbatch_header = self._build_sbatch_header(
+                    part_job_name,
+                    tasks_chunk,
+                    slurm_config,
+                    dependency_job_ids,
+                    jobs_limit=local_jobs_limit,
+                )
+                script_body = self._build_script_body(tasks_chunk, jobs_limit=local_jobs_limit)
+
+                # Write script to temporary file
+                script_path = self._write_script(tier_index, group_index, sbatch_header, script_body)
+
+                # Submit the job (or fake it in dry run mode)
+                job_id = self._submit_sbatch_script(script_path)
+                if progress is not None:
+                    progress.advance(1)
+
+                # Map all artifacts in this chunk to this job ID
+                for task in tasks_chunk:
+                    if task.artifact is not None:
+                        new_mappings[id(task.artifact)] = job_id
+
+                # Extract log file from header
+                log_file = None
+                for line in sbatch_header:
+                    if line.startswith("#SBATCH --output="):
+                        log_file = line.split("=", 1)[1]
+                        break
+
+                # Collect artifact class names and check existence
+                artifact_classes = [
+                    task.artifact.__class__.__name__
+                    for task in tasks_chunk
+                    if task.artifact is not None
+                ]
+
+                # Count how many tasks are complete vs remaining
+                num_complete = sum(
+                    1 for task in tasks_chunk
+                    if task.artifact is not None and task.artifact.exists
+                )
+                num_remaining = len(tasks_chunk) - num_complete
+
+                # Determine which stage this chunk belongs to
+                group_stage = self._determine_group_stage(tasks_chunk, stage_names)
+
+                # Build job info
+                job_info = {
+                    'job_id': job_id,
+                    'job_name': part_job_name,
+                    'tier': tier_index,
+                    'group': group_index,
+                    'stage': group_stage,
+                    'num_tasks': len(tasks_chunk),
+                    'num_complete': num_complete,
+                    'num_remaining': num_remaining,
+                    'artifact_classes': artifact_classes,
+                    'config': slurm_config,
+                    'dependencies': list(dependency_job_ids),
+                    'script_path': script_path,
+                    'log_file': log_file,
+                    'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                }
+
+                # Store job info for dry run summary
+                if self.dry_run:
+                    self._dry_run_jobs.append(job_info)
+
+                # Save job info to persistent storage (per-project)
+                if self.project and not self.dry_run and group_stage:
+                    ConfigManager().save_job_info(self.project, group_stage, job_info)
+
+                # Record relpath -> {job_id, array_index} mappings for launched tasks
+                if not self.dry_run:
+                    if local_jobs_limit is not None and local_jobs_limit > 0 and local_jobs_limit < len(tasks_chunk):
+                        for idx, task in enumerate(tasks_chunk):
+                            if task.artifact is None:
+                                continue
+                            array_index = idx % local_jobs_limit
+                            self._launched_map[task.artifact.relpath] = {
+                                'job_id': job_id,
+                                'array_index': array_index,
+                            }
+                    else:
+                        for idx, task in enumerate(tasks_chunk):
+                            if task.artifact is None:
+                                continue
+                            self._launched_map[task.artifact.relpath] = {
+                                'job_id': job_id,
+                                'array_index': idx,
+                            }
+
+                # Print brief summary (not in dry run mode)
+                if not self.dry_run:
+                    artifact_types = sorted(set(artifact_classes))
+                    artifact_summary = ', '.join(artifact_types) if artifact_types else 'N/A'
+                    stage_str = f" [{group_stage}]" if group_stage else ""
+                    print(f"✓ Submitted job {job_id}: {part_job_name}{stage_str}", file=sys.stderr)
+                    print(f"  Tasks: {len(tasks_chunk)}, Artifacts: {artifact_summary}", file=sys.stderr)
+                    print(f"  Config: partition={slurm_config.get('partition', 'N/A')}, "
+                          f"cpus={slurm_config.get('cpus', 'N/A')}, "
+                          f"gpus={slurm_config.get('gpus', 'N/A')}, "
+                          f"time={slurm_config.get('time', 'N/A')}", file=sys.stderr)
+                    print(file=sys.stderr)
         
         return new_mappings
     
@@ -2003,6 +2049,8 @@ class SlurmExecutor(Executor):
                 if not tasks:
                     continue
                 lines.append(f"  {group_idx})")
+                # Disable immediate exit on error within grouped jobs so failures don't stop the group
+                lines.append("    set +e")
                 for task in tasks:
                     if task.artifact is not None:
                         exp_conf = _artifact_experiment_conf(task.artifact)
