@@ -76,7 +76,29 @@ class Artifact:
                 return str(value)
             if isinstance(value, (str, int, float, bool)) or value is None:
                 return str(value)
-            raise TypeError(f"Unsupported value type in artifact hashing: {type(value).__name__}")
+            if isinstance(value, (list, tuple)):
+                # Recursively hash list/tuple elements
+                elements = []
+                for item in value:
+                    item_hash = atom(item)
+                    if item_hash is not None:
+                        elements.append(item_hash)
+                # Use sorted for deterministic hashing
+                return '[' + ','.join(sorted(elements)) + ']'
+            if isinstance(value, dict):
+                # Recursively hash dict key-value pairs
+                pairs = []
+                for k, v in value.items():
+                    v_hash = atom(v)
+                    if v_hash is not None:
+                        pairs.append(f"{k}:{v_hash}")
+                # Sort by key for deterministic hashing
+                return '{' + ','.join(sorted(pairs)) + '}'
+            # For other types, try str() conversion
+            try:
+                return str(value)
+            except:
+                raise TypeError(f"Unsupported value type in artifact hashing: {type(value).__name__}")
 
         items = [(k, a) for k, v in data.items() if (a := atom(v)) is not None]
         items.sort(key=lambda kv: kv[0])
