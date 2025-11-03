@@ -904,14 +904,32 @@ class ExperimentCLI:
         except Exception:
             pass
         
-        # Write to file
-        output_path = Path(output_file)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        with open(output_path, 'w') as f:
-            json.dump(export_data, f, indent=2)
-        
-        print(f"Exported {len(exported_artifacts)} artifact(s) to {output_file}", file=sys.stderr)
+        # Write to file (support gs:// paths)
+        if output_file.startswith('gs://'):
+            # Upload to GCS using a temporary file
+            import tempfile
+            from .runlib import upload_to_gs
+            
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as tmp_file:
+                json.dump(export_data, tmp_file, indent=2)
+                tmp_path = tmp_file.name
+            
+            try:
+                # Upload to GCS
+                upload_to_gs(tmp_path, output_file, directory=False)
+                print(f"Exported {len(exported_artifacts)} artifact(s) to {output_file}", file=sys.stderr)
+            finally:
+                # Clean up temporary file
+                Path(tmp_path).unlink(missing_ok=True)
+        else:
+            # Write to local file
+            output_path = Path(output_file)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            with open(output_path, 'w') as f:
+                json.dump(export_data, f, indent=2)
+            
+            print(f"Exported {len(exported_artifacts)} artifact(s) to {output_file}", file=sys.stderr)
         if artifacts:
             print(f"  Filtered by artifact types: {', '.join(artifacts)}", file=sys.stderr)
         if exists_only:
