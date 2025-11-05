@@ -183,6 +183,83 @@ class ExperimentCLI:
             help='Split large array submissions into multiple sbatch calls with at most N indices per submission'
         )
         
+        # relaunch command
+        relaunch_parser = subparsers.add_parser('relaunch', help='Cancel and relaunch experiment stages')
+        relaunch_parser.add_argument(
+            'stages',
+            nargs='*',
+            help='Stage names to run (omit for all stages)'
+        )
+        relaunch_parser.add_argument(
+            '--head',
+            type=int,
+            metavar='N',
+            help='Only launch the first N artifacts'
+        )
+        relaunch_parser.add_argument(
+            '--tail',
+            type=int,
+            metavar='N',
+            help='Only launch the last N artifacts'
+        )
+        relaunch_parser.add_argument(
+            '--rerun',
+            action='store_true',
+            help='Ignore exists check and rerun all artifacts'
+        )
+        relaunch_parser.add_argument(
+            '--reverse',
+            action='store_true',
+            help='Launch stages in reverse order (respects dependencies)'
+        )
+        relaunch_parser.add_argument(
+            '--exclude',
+            nargs='+',
+            metavar='STAGE',
+            help='Stage names to exclude from execution'
+        )
+        relaunch_parser.add_argument(
+            '--artifact',
+            nargs='+',
+            metavar='ARTIFACT',
+            help='Artifact class names to include (filters by type)'
+        )
+        relaunch_parser.add_argument(
+            '--jobs',
+            type=int,
+            metavar='N',
+            help='Combine tasks into N parallel jobs by running multiple tasks sequentially in each job'
+        )
+        relaunch_parser.add_argument(
+            '--dependency',
+            nargs='+',
+            metavar='JOBID',
+            help='Job IDs that all launched jobs should depend on'
+        )
+        relaunch_parser.add_argument(
+            '--slurm',
+            nargs='*',
+            metavar='KEY=VALUE',
+            help='Override Slurm args for all jobs (e.g., time=12:00:00 gpus=4 exclude=node[01-04] nodelist=node05)'
+        )
+        relaunch_parser.add_argument(
+            '--force-launch',
+            action='store_true',
+            help='Ignore running check and launch jobs anyway'
+        )
+        relaunch_parser.add_argument(
+            '--throttle',
+            type=int,
+            metavar='N',
+            help='Limit concurrent array tasks to N (adds %%N to --array specification)'
+        )
+        relaunch_parser.add_argument(
+            '--splitjobs',
+            type=int,
+            metavar='N',
+            help='Split large array submissions into multiple sbatch calls with at most N indices per submission'
+        )
+        
         # cancel command
         cancel_parser = subparsers.add_parser('cancel', help='Cancel jobs for stages')
         cancel_parser.add_argument(
@@ -368,6 +445,22 @@ class ExperimentCLI:
                 throttle=getattr(args, 'throttle', None),
                 split_jobs=getattr(args, 'splitjobs', None),
             )
+        elif args.command == 'relaunch':
+            self.relaunch(
+                args.stages,
+                head=getattr(args, 'head', None),
+                tail=getattr(args, 'tail', None),
+                rerun=getattr(args, 'rerun', False),
+                reverse=getattr(args, 'reverse', False),
+                exclude=getattr(args, 'exclude', None),
+                artifacts=getattr(args, 'artifact', None),
+                jobs=getattr(args, 'jobs', None),
+                dependency=getattr(args, 'dependency', None),
+                slurm_overrides=getattr(args, 'slurm', None),
+                force_launch=getattr(args, 'force_launch', False),
+                throttle=getattr(args, 'throttle', None),
+                split_jobs=getattr(args, 'splitjobs', None),
+            )
         elif args.command == 'cancel':
             self.cancel(args.stages)
         elif args.command == 'cat':
@@ -491,6 +584,59 @@ class ExperimentCLI:
         print(f"Successfully cancelled {len(successfully_canceled)} job(s)")
         if failed_to_cancel:
             print(f"Failed to cancel {len(failed_to_cancel)} job(s)")
+    
+    def relaunch(
+        self,
+        stages: List[str],
+        head: Optional[int] = None,
+        tail: Optional[int] = None,
+        rerun: bool = False,
+        reverse: bool = False,
+        exclude: Optional[List[str]] = None,
+        artifacts: Optional[List[str]] = None,
+        jobs: Optional[int] = None,
+        dependency: Optional[List[str]] = None,
+        slurm_overrides: Optional[List[str]] = None,
+        force_launch: bool = False,
+        throttle: Optional[int] = None,
+        split_jobs: Optional[int] = None,
+    ) -> None:
+        """Cancel and relaunch experiment stages.
+        
+        This method cancels jobs for the selected stages, then launches
+        the same stages with the provided launch options.
+        """
+        # Compute selected stages exactly like launch (respecting exclude and reverse)
+        selected = stages if stages else list(self.executor._stages.keys())
+        
+        # Exclude specified stages
+        if exclude:
+            selected = [s for s in selected if s not in exclude]
+        
+        if reverse:
+            selected = list(reversed(selected))
+        
+        # Cancel only the selected stages
+        self.cancel(selected)
+        
+        # Launch the same selected stages with provided options
+        # Note: reverse and exclude are already applied, so we pass False and None
+        self.launch(
+            selected,
+            dry_run=False,
+            head=head,
+            tail=tail,
+            rerun=rerun,
+            reverse=False,   # already applied
+            exclude=None,    # already applied
+            artifacts=artifacts,
+            jobs=jobs,
+            dependency=dependency,
+            slurm_overrides=slurm_overrides,
+            force_launch=force_launch,
+            throttle=throttle,
+            split_jobs=split_jobs,
+        )
     
     def cat(self, job_spec: str, array_index: Optional[int] = None) -> None:
         """Print log file for a job.

@@ -1,6 +1,7 @@
 """Analysis utilities for loading and processing exported experiment data."""
 
 import json
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
@@ -11,11 +12,85 @@ except ImportError:
     HAS_PANDAS = False
 
 
-def load_export(file_path: Union[str, Path]) -> Dict[str, Any]:
+# Pattern to match artifact references: ClassName(hash)
+_ARTIFACT_REF_PATTERN = re.compile(r'^([A-Za-z_][A-Za-z0-9_]*)\(([a-f0-9]+)\)$')
+
+
+def _parse_artifact_reference(value: str) -> Optional[tuple[str, str]]:
+    """Parse an artifact reference string.
+    
+    Args:
+        value: String that might be an artifact reference (e.g., "MyArtifact(abc123)")
+        
+    Returns:
+        Tuple of (artifact_type, hash) if value is an artifact reference, None otherwise
+    """
+    if not isinstance(value, str):
+        return None
+    
+    match = _ARTIFACT_REF_PATTERN.match(value)
+    if match:
+        return (match.group(1), match.group(2))
+    return None
+
+
+def _build_artifact_map(artifacts: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    """Build a mapping from artifact hash to artifact dictionary.
+    
+    Args:
+        artifacts: List of artifact dictionaries
+        
+    Returns:
+        Dictionary mapping hash to artifact dictionary
+    """
+    artifact_map = {}
+    for artifact in artifacts:
+        artifact_hash = artifact.get('hash')
+        if artifact_hash:
+            artifact_map[artifact_hash] = artifact
+    return artifact_map
+
+
+def _resolve_artifact_references(
+    value: Any,
+    artifact_map: Dict[str, Dict[str, Any]]
+) -> Any:
+    """Recursively resolve artifact references in a value.
+    
+    Args:
+        value: Value that may contain artifact references
+        artifact_map: Mapping from hash to artifact dictionary
+        
+    Returns:
+        Value with artifact references resolved to artifact dictionaries
+    """
+    if isinstance(value, str):
+        # Check if this is an artifact reference
+        ref = _parse_artifact_reference(value)
+        if ref:
+            artifact_type, artifact_hash = ref
+            artifact = artifact_map.get(artifact_hash)
+            if artifact:
+                # Verify the type matches
+                if artifact.get('artifact_type') == artifact_type:
+                    return artifact
+        return value
+    elif isinstance(value, list):
+        # Recursively resolve list elements
+        return [_resolve_artifact_references(item, artifact_map) for item in value]
+    elif isinstance(value, dict):
+        # Recursively resolve dict values
+        return {k: _resolve_artifact_references(v, artifact_map) for k, v in value.items()}
+    else:
+        return value
+
+
+def load_export(file_path: Union[str, Path], resolve: bool = False) -> Dict[str, Any]:
     """Load the complete exported JSON file.
     
     Args:
         file_path: Path to the exported JSON file
+        resolve: If True, resolve artifact references (e.g., "MyArtifact(hash)") to actual artifacts
         
     Returns:
         Dictionary containing project_config, global_config, and artifacts
@@ -29,7 +104,22 @@ def load_export(file_path: Union[str, Path]) -> Dict[str, Any]:
         raise FileNotFoundError(f"Export file not found: {file_path}")
     
     with open(path, 'r') as f:
-        return json.load(f)
+        data = json.load(f)
+    
+    if resolve:
+        # Build artifact map for resolution
+        artifacts = data.get('artifacts', [])
+        artifact_map = _build_artifact_map(artifacts)
+        
+        # Resolve references in all artifacts
+        resolved_artifacts = []
+        for artifact in artifacts:
+            resolved_artifact = _resolve_artifact_references(artifact, artifact_map)
+            resolved_artifacts.append(resolved_artifact)
+        
+        data['artifacts'] = resolved_artifacts
+    
+    return data
 
 
 def get_project_config(file_path: Union[str, Path]) -> Dict[str, Any]:
@@ -58,16 +148,17 @@ def get_global_config(file_path: Union[str, Path]) -> Dict[str, Any]:
     return data.get('global_config', {})
 
 
-def get_artifacts(file_path: Union[str, Path]) -> List[Dict[str, Any]]:
+def get_artifacts(file_path: Union[str, Path], resolve: bool = False) -> List[Dict[str, Any]]:
     """Extract artifacts list from export file.
     
     Args:
         file_path: Path to the exported JSON file
+        resolve: If True, resolve artifact references (e.g., "MyArtifact(hash)") to actual artifacts
         
     Returns:
         List of artifact dictionaries
     """
-    data = load_export(file_path)
+    data = load_export(file_path, resolve=resolve)
     return data.get('artifacts', [])
 
 
@@ -159,7 +250,8 @@ def load_artifacts_df(
     stage: Optional[Union[str, List[str]]] = None,
     artifact_types: Optional[Union[str, List[str]]] = None,
     exists: Optional[bool] = None,
-    flatten: bool = True
+    flatten: bool = True,
+    resolve: bool = False
 ) -> 'pd.DataFrame':
     """Load artifacts as a pandas DataFrame with optional filtering.
     
@@ -169,6 +261,7 @@ def load_artifacts_df(
         artifact_types: Artifact type name(s) to filter by (None = no filter)
         exists: If True, only existing artifacts; if False, only non-existing (None = no filter)
         flatten: If True, flatten nested dictionaries with dot-separated keys
+        resolve: If True, resolve artifact references (e.g., "MyArtifact(hash)") to actual artifacts
         
     Returns:
         pandas DataFrame with artifacts as rows
@@ -182,7 +275,7 @@ def load_artifacts_df(
             "Install with: pip install pandas"
         )
     
-    artifacts = get_artifacts(file_path)
+    artifacts = get_artifacts(file_path, resolve=resolve)
     
     # Apply filters
     artifacts = filter_artifacts(artifacts, stage=stage, artifact_types=artifact_types, exists=exists)
@@ -298,20 +391,44 @@ def count_by_type(file_path: Union[str, Path]) -> Dict[str, int]:
 
 def get_artifact_by_relpath(
     file_path: Union[str, Path],
-    relpath: str
+    relpath: str,
+    resolve: bool = False
 ) -> Optional[Dict[str, Any]]:
     """Find an artifact by its relpath.
     
     Args:
         file_path: Path to the exported JSON file
         relpath: Relative path of the artifact to find
+        resolve: If True, resolve artifact references in the returned artifact
         
     Returns:
         Artifact dictionary if found, None otherwise
     """
-    artifacts = get_artifacts(file_path)
+    artifacts = get_artifacts(file_path, resolve=resolve)
     for artifact in artifacts:
         if artifact.get('relpath') == relpath:
+            return artifact
+    return None
+
+
+def get_artifact_by_hash(
+    file_path: Union[str, Path],
+    artifact_hash: str,
+    resolve: bool = False
+) -> Optional[Dict[str, Any]]:
+    """Find an artifact by its hash.
+    
+    Args:
+        file_path: Path to the exported JSON file
+        artifact_hash: Hash of the artifact to find
+        resolve: If True, resolve artifact references in the returned artifact
+        
+    Returns:
+        Artifact dictionary if found, None otherwise
+    """
+    artifacts = get_artifacts(file_path, resolve=resolve)
+    for artifact in artifacts:
+        if artifact.get('hash') == artifact_hash:
             return artifact
     return None
 
@@ -322,7 +439,8 @@ def export_to_csv(
     stage: Optional[Union[str, List[str]]] = None,
     artifact_types: Optional[Union[str, List[str]]] = None,
     exists: Optional[bool] = None,
-    flatten: bool = True
+    flatten: bool = True,
+    resolve: bool = False
 ) -> None:
     """Export artifacts to CSV file.
     
@@ -333,11 +451,12 @@ def export_to_csv(
         artifact_types: Artifact type name(s) to filter by (None = no filter)
         exists: If True, only existing artifacts; if False, only non-existing (None = no filter)
         flatten: If True, flatten nested dictionaries with dot-separated keys
+        resolve: If True, resolve artifact references (e.g., "MyArtifact(hash)") to actual artifacts
         
     Raises:
         ImportError: If pandas is not installed
     """
-    df = load_artifacts_df(file_path, stage=stage, artifact_types=artifact_types, exists=exists, flatten=flatten)
+    df = load_artifacts_df(file_path, stage=stage, artifact_types=artifact_types, exists=exists, flatten=flatten, resolve=resolve)
     df.to_csv(output_file, index=False)
     print(f"Exported {len(df)} artifact(s) to {output_file}")
 
