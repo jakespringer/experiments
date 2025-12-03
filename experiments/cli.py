@@ -177,7 +177,7 @@ class ExperimentCLI:
             help='Limit concurrent array tasks to N (adds %%N to --array specification)'
         )
         drylaunch_parser.add_argument(
-            '--splitjobs',
+            '--splitjobs', '--split-jobs',
             type=int,
             metavar='N',
             help='Split large array submissions into multiple sbatch calls with at most N indices per submission'
@@ -254,10 +254,15 @@ class ExperimentCLI:
             help='Limit concurrent array tasks to N (adds %%N to --array specification)'
         )
         relaunch_parser.add_argument(
-            '--splitjobs',
+            '--splitjobs', '--split-jobs',
             type=int,
             metavar='N',
             help='Split large array submissions into multiple sbatch calls with at most N indices per submission'
+        )
+        relaunch_parser.add_argument(
+            '--cancelafter',
+            action='store_true',
+            help='Cancel previous jobs after launching new ones (default: cancel before)'
         )
         
         # cancel command
@@ -460,6 +465,7 @@ class ExperimentCLI:
                 force_launch=getattr(args, 'force_launch', False),
                 throttle=getattr(args, 'throttle', None),
                 split_jobs=getattr(args, 'splitjobs', None),
+                cancel_after=getattr(args, 'cancelafter', False),
             )
         elif args.command == 'cancel':
             self.cancel(args.stages)
@@ -480,12 +486,29 @@ class ExperimentCLI:
         self.executor.dry_run = dry_run
         
         # Apply CLI slurm overrides (highest priority)
+        def _norm_key(k: str) -> str:
+            return k.strip().lower().replace('-', '_')
+        def _to_bool(v: str) -> Any:
+            s = v.strip().lower()
+            if s in ('true','yes','y','1'): return True
+            if s in ('false','no','n','0',''): return False
+            return v
+        def _to_int_if_numeric(v: str) -> Any:
+            return int(v) if v.isdigit() else v
         overrides: Dict[str, Any] = {}
         if slurm_overrides:
             for item in slurm_overrides:
                 if '=' in item:
                     k, v = item.split('=', 1)
-                    overrides[k.strip()] = v.strip()
+                    nk = _norm_key(k)
+                    if nk == 'array':
+                        print("Error: --slurm array=... is not supported. Arrays are managed by the executor.", file=sys.stderr)
+                        sys.exit(1)
+                    # basic coercion
+                    vv: Any = _to_bool(v)
+                    if isinstance(vv, str):
+                        vv = _to_int_if_numeric(vv)
+                    overrides[nk] = vv
         
         # Handle throttle: CLI --throttle takes precedence over --slurm throttle=N
         throttle_value = None
@@ -526,7 +549,7 @@ class ExperimentCLI:
             selected = list(reversed(selected))
         self.executor.execute(selected, head=head, tail=tail, rerun=rerun, artifacts=artifacts, jobs=jobs)
     
-    def cancel(self, stages: List[str]) -> None:
+    def cancel(self, stages: List[str], exclude_job_ids: Optional[List[str]] = None) -> None:
         """Cancel jobs for the specified stages."""
         if not Project.name:
             print("Error: No project specified in executor")
@@ -559,6 +582,9 @@ class ExperimentCLI:
         
         # Filter out already canceled jobs
         jobs_to_cancel = job_ids - canceled_jobs
+        # Exclude any explicitly provided job IDs (e.g., newly launched)
+        if exclude_job_ids:
+            jobs_to_cancel -= set(exclude_job_ids)
         
         if not jobs_to_cancel:
             print("No new jobs to cancel.")
@@ -600,6 +626,7 @@ class ExperimentCLI:
         force_launch: bool = False,
         throttle: Optional[int] = None,
         split_jobs: Optional[int] = None,
+        cancel_after: bool = False,
     ) -> None:
         """Cancel and relaunch experiment stages.
         
@@ -616,27 +643,54 @@ class ExperimentCLI:
         if reverse:
             selected = list(reversed(selected))
         
-        # Cancel only the selected stages
-        self.cancel(selected)
-        
-        # Launch the same selected stages with provided options
-        # Note: reverse and exclude are already applied, so we pass False and None
-        self.launch(
-            selected,
-            dry_run=False,
-            head=head,
-            tail=tail,
-            rerun=rerun,
-            reverse=False,   # already applied
-            exclude=None,    # already applied
-            artifacts=artifacts,
-            jobs=jobs,
-            dependency=dependency,
-            slurm_overrides=slurm_overrides,
-            force_launch=force_launch,
-            throttle=throttle,
-            split_jobs=split_jobs,
-        )
+        if not cancel_after:
+            # Cancel only the selected stages first (default behavior)
+            self.cancel(selected)
+
+            # Then launch the same selected stages with provided options
+            self.launch(
+                selected,
+                dry_run=False,
+                head=head,
+                tail=tail,
+                rerun=rerun,
+                reverse=False,   # already applied
+                exclude=None,    # already applied
+                artifacts=artifacts,
+                jobs=jobs,
+                dependency=dependency,
+                slurm_overrides=slurm_overrides,
+                force_launch=force_launch,
+                throttle=throttle,
+                split_jobs=split_jobs,
+            )
+        else:
+            # Launch first
+            self.launch(
+                selected,
+                dry_run=False,
+                head=head,
+                tail=tail,
+                rerun=rerun,
+                reverse=False,   # already applied
+                exclude=None,    # already applied
+                artifacts=artifacts,
+                jobs=jobs,
+                dependency=dependency,
+                slurm_overrides=slurm_overrides,
+                force_launch=force_launch,
+                throttle=throttle,
+                split_jobs=split_jobs,
+            )
+
+            # Then cancel previous jobs, excluding newly launched job IDs
+            recent_ids: List[str] = []
+            if hasattr(self.executor, 'recent_job_ids'):
+                try:
+                    recent_ids = list(getattr(self.executor, 'recent_job_ids') or [])
+                except Exception:
+                    recent_ids = []
+            self.cancel(selected, exclude_job_ids=recent_ids)
     
     def cat(self, job_spec: str, array_index: Optional[int] = None) -> None:
         """Print log file for a job.

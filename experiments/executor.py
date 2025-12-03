@@ -19,52 +19,27 @@ from .artifact import Artifact, ArtifactSet
 from .config import ConfigManager
 from .project import Project
 
-# Optional pretty progress bar (stderr). Falls back gracefully if unavailable.
-try:
-    from tqdm import tqdm as _tqdm  # type: ignore
-except Exception:  # pragma: no cover
-    _tqdm = None
-
-
+# Progress reporting via pretty printing only (no tqdm dependency)
 class _Progress:
-    """Minimal progress helper that writes to stderr (pretty with tqdm if available)."""
+    """Simple progress status printer (no external dependencies)."""
 
     def __init__(self, total: int, desc: str) -> None:
         self._total = max(0, int(total))
         self._count = 0
         self._desc = desc
-        if _tqdm is not None and self._total > 0:
-            self._bar = _tqdm(
-                total=self._total,
-                desc=desc,
-                file=sys.stderr,
-                bar_format="{l_bar}{bar} | {n_fmt}/{total_fmt} steps",
-                leave=False,
-            )
-        else:
-            self._bar = None
-            self._render()
+        self._render()
 
     def set(self, desc: str) -> None:
         self._desc = desc
-        if self._bar is not None:
-            self._bar.set_description(desc)
-        else:
-            self._render()
+        self._render()
 
     def advance(self, n: int = 1) -> None:
-        if self._bar is not None:
-            self._bar.update(n)
-        else:
-            self._count = min(self._total, self._count + n)
-            self._render()
+        self._count = min(self._total, self._count + n)
+        self._render()
 
     def close(self) -> None:
-        if self._bar is not None:
-            self._bar.close()
-        else:
-            sys.stderr.write("\n")
-            sys.stderr.flush()
+        sys.stderr.write("\n")
+        sys.stderr.flush()
 
     def _render(self) -> None:
         sys.stderr.write(f"\r{self._desc} [{self._count}/{self._total}]")
@@ -321,12 +296,16 @@ class UploadToGSTaskBlock(TaskBlock):
         dest_path = self.gs_path
         if self.directory:
             if self.contents is True:
-                # Copy contents: use wildcard on source, no trailing slash on dest
+                # Copy contents: use wildcard on source, trailing slash on dest
                 source_path = source_path.rstrip('/') + '/*'
-                dest_path = dest_path.rstrip('/')
+                dest_path = dest_path.rstrip('/') + '/'
             elif self.contents is False:
-                source_path = source_path.rstrip('/')
-                dest_path = dest_path.rstrip('/')
+                source_path = source_path.rstrip('/') + '/'
+                dest_path = dest_path.rstrip('/') + '/'
+            else:
+                # contents is None: ensure dest has trailing slash
+                if not dest_path.endswith('/'):
+                    dest_path = dest_path + '/'
 
         # Build the gsutil command
         if self.directory:
@@ -367,13 +346,9 @@ class DownloadFromGSTaskBlock(TaskBlock):
         path_hash = hashlib.sha256(self.path.encode("utf-8")).hexdigest()[:10]
         lockfile = f"/tmp/{path_hash}.lock"
 
-        # Build the inner command (existence check + download)
-        inner_parts = []
-        
-        # If skip_existing is enabled, check if path already exists
-        if self.skip_existing:
-            inner_parts.append(f"[ ! -e {dquote(self.path)} ]")
-        
+        # Build the inner command (mkdir + download)
+        inner_parts: List[str] = []
+
         # Prepare source and destination paths, respecting contents flag
         source_path = self.gs_path
         dest_path = self.path
@@ -395,19 +370,25 @@ class DownloadFromGSTaskBlock(TaskBlock):
             parent = os.path.dirname(self.path) or "."
             inner_parts.append(f"mkdir -p -- {dquote(parent)}")
             gsutil_cmd = f"gsutil cp {dquote(source_path)} {dquote(dest_path)}"
-        
         inner_parts.append(gsutil_cmd)
-        
-        # Combine inner parts
-        inner_cmd = " && ".join(inner_parts)
-        
-        # Wrap entire command (including existence check) in flock
+
+        base_cmd = " && ".join(inner_parts)
+
+        # Wrap entire command in flock; when skip_existing is enabled, guard it with an
+        # if/else block so only a pre-existing path causes a skip.
         if self.skip_existing:
-            # Add skip message for when file exists
-            locked_cmd = f"flock -x {dquote(lockfile)} -c {dquote(inner_cmd)} || echo \"Skipping download, {self.path} already exists\""
+            script_lines = [
+                f"if [ ! -e {dquote(self.path)} ]; then",
+                f"  {base_cmd}",
+                "else",
+                f"  echo \"Skipping download, {self.path} already exists\"",
+                "fi",
+            ]
+            inner_script = "\n".join(script_lines)
+            locked_cmd = f"flock -x {dquote(lockfile)} -c {dquote(inner_script)}"
         else:
-            locked_cmd = f"flock -x {dquote(lockfile)} -c {dquote(inner_cmd)}"
-        
+            locked_cmd = f"flock -x {dquote(lockfile)} -c {dquote(base_cmd)}"
+
         if self.no_fail:
             return f"{locked_cmd} || true"
         return locked_cmd
@@ -430,27 +411,34 @@ class DownloadTaskBlock(TaskBlock):
 
     def execute(self) -> str:
         """Generate shell command to download the file."""
-        parts = []
-        
+        parts: List[str] = []
+
         # Create parent directory if needed
         if self.mkdirs:
             parent = os.path.dirname(self.local_path) or "."
             parts.append(f"mkdir -p -- {dquote(parent)}")
-        
+
         # Build the curl command
         # -L: follow redirects
         # -o: output file
         curl_cmd = f"curl -L {dquote(self.url)} -o {dquote(self.local_path)}"
         parts.append(curl_cmd)
-        
+
         download_cmd = " && ".join(parts)
-        
-        # If skip_existing is enabled, check if file already exists
-        if self.skip_existing:
-            # Skip download if file exists
-            return f"[ ! -e {dquote(self.local_path)} ] && {{ {download_cmd}; }} || echo \"Skipping download, {self.local_path} already exists\""
-        else:
+
+        if not self.skip_existing:
             return download_cmd
+
+        # When skip_existing is enabled, wrap the full command chain in an if/else block
+        # so that only a pre-existing path causes a skip. Real errors still surface.
+        lines = [
+            f"if [ ! -e {dquote(self.local_path)} ]; then",
+            f"  {download_cmd}",
+            "else",
+            f"  echo \"Skipping download, {self.local_path} already exists\"",
+            "fi",
+        ]
+        return "\n".join(lines)
 
 
 class EnsureDirectoryTaskBlock(TaskBlock):
@@ -481,24 +469,31 @@ class DownloadHFModelTaskBlock(TaskBlock):
 
     def execute(self) -> str:
         """Generate shell command to download the HF model."""
-        parts = []
-        
+        parts: List[str] = []
+
         # Create directory if needed
         if self.mkdirs:
             parts.append(f"mkdir -p -- {dquote(self.local_dir)}")
-        
+
         # Build the hf download command
         hf_cmd = f"hf download {dquote(self.model_name)} --local-dir {dquote(self.local_dir)}"
         parts.append(hf_cmd)
-        
+
         download_cmd = " && ".join(parts)
-        
-        # If skip_existing is enabled, check if directory already exists and is non-empty
-        if self.skip_existing:
-            # Skip download if directory exists and is not empty
-            return f"[ ! -e {dquote(self.local_dir)} ] && {{ {download_cmd}; }} || echo \"Skipping download, {self.local_dir} already exists\""
-        else:
+
+        if not self.skip_existing:
             return download_cmd
+
+        # When skip_existing is enabled, wrap the full command chain in an if/else block
+        # so that only a pre-existing path causes a skip. Real errors still surface.
+        lines = [
+            f"if [ ! -e {dquote(self.local_dir)} ]; then",
+            f"  {download_cmd}",
+            "else",
+            f"  echo \"Skipping download, {self.local_dir} already exists\"",
+            "fi",
+        ]
+        return "\n".join(lines)
 
 
 class RsyncToGSTaskBlock(TaskBlock):
@@ -625,52 +620,56 @@ class RsyncFromGSTaskBlock(TaskBlock):
             dest_path = dest_path.rstrip('/')
         # If contents is None, leave paths as-is
 
-        # Build the inner command (all checks + mkdir + rsync)
-        inner_parts = []
-        
-        # If skip_existing is enabled, check if local path already exists
-        if self.skip_existing:
-            inner_parts.append(f"[ ! -e {dquote(self.path.rstrip('/'))} ]")
-        
+        # Build the core inner command (remote checks + mkdir + rsync)
+        inner_parts: List[str] = []
+
         # If check_exists is enabled, check if the remote path exists
         if self.check_exists:
             inner_parts.append(f"gsutil -q ls {dquote(source_path)} > /dev/null 2>&1")
-        
+
         # Create necessary directory before sync
         # Use the original path (without trailing slash) for mkdir
-        inner_parts.append(f"mkdir -p -- {dquote(self.path.rstrip('/'))}")
+        target_path = self.path.rstrip('/')
+        inner_parts.append(f"mkdir -p -- {dquote(target_path)}")
 
         # Build the gsutil rsync command
         # -r for recursive sync, -m for parallel operations
         gsutil_cmd_parts = ["gsutil", "-m", "rsync", "-r"]
-        
+
         # Add optional flags
         if self.delete:
             gsutil_cmd_parts.append("-d")  # Delete files in dest not in source
         if self.checksum:
             gsutil_cmd_parts.append("-c")  # Use checksum instead of mtime
-        
+
         # Add source and destination (with potential trailing slashes)
         gsutil_cmd_parts.extend([dquote(source_path), dquote(dest_path)])
         gsutil_cmd = " ".join(gsutil_cmd_parts)
-        
+
         inner_parts.append(gsutil_cmd)
-        
-        # Combine inner parts
-        inner_cmd = " && ".join(inner_parts)
-        
-        # Wrap entire command (including all checks) in flock
-        locked_cmd = f"flock -x {dquote(lockfile)} -c {dquote(inner_cmd)}"
-        
-        # Add appropriate skip message based on what checks are enabled
-        if self.skip_existing and self.check_exists:
-            cmd = f"{locked_cmd} || echo \"Skipping sync (path exists or remote unavailable)\""
-        elif self.skip_existing:
-            cmd = f"{locked_cmd} || echo \"Skipping sync, {self.path} already exists\""
-        elif self.check_exists:
-            cmd = f"{locked_cmd} || echo \"Skipping rsync, remote path {source_path} does not exist\""
+
+        base_cmd = " && ".join(inner_parts)
+
+        # Wrap entire command in flock; when skip_existing is enabled, guard it with an
+        # if/else block so only a pre-existing local path causes a skip. Remote
+        # existence checks still run inside the guarded section when configured.
+        if self.skip_existing:
+            script_lines = [
+                f"if [ ! -e {dquote(target_path)} ]; then",
+                f"  {base_cmd}",
+                "else",
+                f"  echo \"Skipping sync, {self.path} already exists\"",
+                "fi",
+            ]
+            inner_script = "\n".join(script_lines)
+            locked_cmd = f"flock -x {dquote(lockfile)} -c {dquote(inner_script)}"
         else:
-            cmd = locked_cmd
+            locked_cmd = f"flock -x {dquote(lockfile)} -c {dquote(base_cmd)}"
+
+        cmd = locked_cmd
+        if self.check_exists and not self.skip_existing:
+            cmd = f"{locked_cmd} || echo \"Skipping rsync, remote path {source_path} does not exist\""
+
         if self.no_fail:
             return f"{cmd} || true"
         return cmd
@@ -713,6 +712,128 @@ def _find_artifact_dependencies(value: Any) -> Iterable[Artifact]:
     elif isinstance(value, (list, tuple, set)):
         for v in value:
             yield from _find_artifact_dependencies(v)
+
+
+# ---- Slurm option normalization and rendering helpers ----
+def _to_bool(value: Any) -> Any:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in ("true", "yes", "y", "1"):  # truthy
+            return True
+        if v in ("false", "no", "n", "0", ""):  # falsy/empty
+            return False
+    return value
+
+
+def _to_int_if_numeric(value: Any) -> Any:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.isdigit():
+        try:
+            return int(value)
+        except Exception:
+            return value
+    return value
+
+
+def _norm_key(key: str) -> str:
+    return key.strip().lower().replace('-', '_')
+
+
+def _parse_gres_gpu(gres_value: str) -> Dict[str, Any]:
+    """Parse gres string(s) and extract GPU info.
+
+    Supports comma-separated entries, e.g. "gpu:2", "gpu:a100:2", "nvme:100G".
+    Returns {total: int|None, types: Dict[str,int]} for GPUs.
+    """
+    total = 0
+    types: Dict[str, int] = {}
+    try:
+        entries = [e.strip() for e in str(gres_value).split(',') if e.strip()]
+        for ent in entries:
+            parts = ent.split(':')
+            if not parts:
+                continue
+            if parts[0] != 'gpu':
+                continue
+            # Formats: gpu:COUNT | gpu:TYPE:COUNT
+            if len(parts) == 2:
+                # gpu:COUNT
+                try:
+                    cnt = int(parts[1])
+                except Exception:
+                    continue
+                total += cnt
+                types.setdefault('gpu', 0)
+                types['gpu'] += cnt
+            elif len(parts) >= 3:
+                gtype = parts[1] or 'gpu'
+                try:
+                    cnt = int(parts[2])
+                except Exception:
+                    continue
+                total += cnt
+                types.setdefault(gtype, 0)
+                types[gtype] += cnt
+    except Exception:
+        pass
+    return {"total": (total or None), "types": types}
+
+
+def _normalize_slurm_config(raw: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize sbatch-like options to canonical keys/forms.
+
+    - lower-case keys, '-'→'_' in keys
+    - normalize booleans and simplistic ints
+    - cpus→cpus_per_task if missing
+    - mem-per-cpu→mem_per_cpu; gpus-per-...→gpus_per_...
+    - exclusive mapping; exclusive=no => share
+    - collect parsed GPU info under _gpu_summary (for printing only)
+    - drop/ignore 'array' key (handled internally)
+    """
+    cfg: Dict[str, Any] = {}
+
+    # First pass: key normalization and primitive coercion
+    for k, v in raw.items():
+        nk = _norm_key(k)
+        if nk == 'array':
+            # Ignore; array is orchestrated internally
+            sys.stderr.write("Warning: Ignoring 'array' option from configuration; job arrays are managed by executor.\n")
+            continue
+        # Preserve values; coerce basic types when obvious
+        vv: Any = v
+        if isinstance(v, str):
+            # try boolean first; if not boolean and numeric digits, to int
+            vb = _to_bool(v)
+            if isinstance(vb, bool):
+                vv = vb
+            else:
+                vv = _to_int_if_numeric(v)
+        cfg[nk] = vv
+
+    # Synonyms normalization
+    if 'cpus' in cfg and 'cpus_per_task' not in cfg:
+        cfg['cpus_per_task'] = cfg.pop('cpus')
+    # hyphen variants are already dashed→underscored via _norm_key
+    # GPU variants retained as-is: gpus, gpus_per_node, gpus_per_task
+
+    # Exclusive/share mapping
+    if 'exclusive' in cfg:
+        val = cfg.get('exclusive')
+        sval = str(val).lower() if not isinstance(val, bool) else ('true' if val else 'false')
+        if sval in ('no', 'false', '0'):
+            cfg.pop('exclusive', None)
+        elif sval in ('yes', 'true', '1', ''):
+            cfg['exclusive'] = True
+        elif sval in ('user', 'mcs'):
+            cfg['exclusive'] = sval
+        # else leave as-is (string value)
+
+    return cfg
 
 
 class Executor:
@@ -1283,6 +1404,7 @@ class SlurmExecutor(Executor):
         self._launched_map: Dict[str, Any] = {}
         self._global_config: Dict[str, Any] = global_conf
         self.split_jobs: int | None = None  # If set, split large arrays into multiple sbatch submissions
+        self.recent_job_ids: List[str] = []
 
     def auto_cli(self) -> None:
         """Launch the CLI interface for this executor."""
@@ -1390,6 +1512,8 @@ class SlurmExecutor(Executor):
         # Persist launched mapping after launch
         if not self.dry_run:
             self._save_launched_jobs(self._launched_map)
+        # Track recent job IDs from this launch
+        self.recent_job_ids = sorted(set(all_job_ids))
 
         progress.set("Done")
         progress.close()
@@ -1569,18 +1693,19 @@ class SlurmExecutor(Executor):
                                 'array_index': idx,
                             }
 
-                # Print brief summary (not in dry run mode)
+                # Pretty job box (not in dry run mode)
                 if not self.dry_run:
-                    artifact_types = sorted(set(artifact_classes))
-                    artifact_summary = ', '.join(artifact_types) if artifact_types else 'N/A'
-                    stage_str = f" [{group_stage}]" if group_stage else ""
-                    print(f"✓ Submitted job {job_id}: {part_job_name}{stage_str}", file=sys.stderr)
-                    print(f"  Tasks: {len(tasks_chunk)}, Artifacts: {artifact_summary}", file=sys.stderr)
-                    print(f"  Config: partition={slurm_config.get('partition', 'N/A')}, "
-                          f"cpus={slurm_config.get('cpus', 'N/A')}, "
-                          f"gpus={slurm_config.get('gpus', 'N/A')}, "
-                          f"time={slurm_config.get('time', 'N/A')}", file=sys.stderr)
-                    print(file=sys.stderr)
+                    self._print_job_box({
+                        'job_id': job_id,
+                        'job_name': part_job_name,
+                        'stage': group_stage,
+                        'num_tasks': len(tasks_chunk),
+                        'artifact_classes': artifact_classes,
+                        'config': slurm_config,
+                        'dependencies': list(dependency_job_ids),
+                        'script_path': script_path,
+                        'log_file': log_file,
+                    })
         
         return new_mappings
     
@@ -1678,14 +1803,12 @@ class SlurmExecutor(Executor):
         
         reqs = dict(task.artifact.get_requirements())  # type: ignore[attr-defined]
         
-        # Validate that all keys are recognized
-        invalid_keys = set(reqs.keys()) - self.VALID_REQUIREMENT_KEYS
-        if invalid_keys:
-            artifact_name = task.artifact.__class__.__name__
-            raise ValueError(
-                f"Invalid requirement key(s) in {artifact_name}.get_requirements(): {invalid_keys}. "
-                f"Valid keys are: {sorted(self.VALID_REQUIREMENT_KEYS)}"
+        # Disallow user-specified array; executor manages array sizing
+        if 'array' in reqs:
+            sys.stderr.write(
+                f"Warning: Ignoring 'array' in {task.artifact.__class__.__name__}.get_requirements(); job arrays are managed by executor.\n"
             )
+            reqs.pop('array', None)
         
         # Normalize: convert 'cpus' to 'cpus_per_task' for consistency
         if 'cpus' in reqs and 'cpus_per_task' not in reqs:
@@ -1783,39 +1906,32 @@ class SlurmExecutor(Executor):
         # Apply CLI overrides (highest priority)
         if getattr(self, 'cli_slurm_overrides', None):
             config.update(self.cli_slurm_overrides)
-        
+
         # Apply final defaults only if not set
         config.setdefault('partition', default_partition)
         config.setdefault('time', '2-00:00:00')
-        
+
+        # Normalize keys/values and special mappings
+        config = _normalize_slurm_config(config)
+
         # Set default cpus_per_task based on GPUs if not specified
         if 'cpus_per_task' not in config and 'gpus' in config:
-            # Try to extract GPU count
             gpus_val = str(config['gpus'])
             if ':' in gpus_val:
-                # Format like "A6000:4" - extract number after colon
                 try:
                     gpu_count = int(gpus_val.split(':')[-1])
                     config['cpus_per_task'] = gpu_count
                 except ValueError:
                     config['cpus_per_task'] = 1
             else:
-                # Try to parse as integer
                 try:
                     config['cpus_per_task'] = int(gpus_val)
                 except ValueError:
-                    # Single GPU name like "A6000"
                     config['cpus_per_task'] = 1
-        
-        # Normalize cpus -> cpus_per_task even if provided via defaults/overrides
-        if 'cpus' in config and 'cpus_per_task' not in config:
-            config['cpus_per_task'] = config.pop('cpus')
-        elif 'cpus' in config and 'cpus_per_task' in config:
-            config.pop('cpus')
 
         # Final fallback for cpus_per_task
         config.setdefault('cpus_per_task', 1)
-        
+
         return config
 
     # ---- Running job tracking helpers ----
@@ -1929,8 +2045,18 @@ class SlurmExecutor(Executor):
             lines.append(f"#SBATCH --chdir={config['chdir']}")
         
         # Dependencies: wait for all previous tier jobs to complete successfully
-        # Also include any external dependencies specified via CLI
+        # Also include any external dependencies specified via CLI and config-provided dependency
         all_dependencies = list(dependency_job_ids)
+        # Include dependency from config if provided (string passes through)
+        conf_dep = config.get('dependency')
+        if conf_dep:
+            if isinstance(conf_dep, str):
+                # If supplied as full spec (e.g., afterok:12345:12346), append as-is
+                # We'll include it as a separate --dependency line
+                lines.append(f"#SBATCH --dependency={conf_dep}")
+            elif isinstance(conf_dep, (list, tuple)):
+                for dep in conf_dep:
+                    lines.append(f"#SBATCH --dependency={dep}")
         if hasattr(self, 'external_dependencies') and self.external_dependencies:
             all_dependencies.extend(self.external_dependencies)
         
@@ -1963,8 +2089,8 @@ class SlurmExecutor(Executor):
             lines.append(f"#SBATCH --mem-per-cpu={config['mem_per_cpu']}")
         
         # GPU handling
-        # Support modern --gpus flag
-        if 'gpus' in config:
+        # Support modern --gpus flag (only if explicitly set)
+        if config.get('gpus') is not None:
             gpus_str = str(config['gpus'])
             lines.append(f"#SBATCH --gpus={gpus_str}")
         # Support --gres for older clusters
@@ -1993,6 +2119,15 @@ class SlurmExecutor(Executor):
         if 'mail_user' in config:
             lines.append(f"#SBATCH --mail-user={config['mail_user']}")
         
+        # Exclusive only (shared is default in Slurm)
+        if 'exclusive' in config:
+            val = config.get('exclusive')
+            if isinstance(val, bool):
+                if val:
+                    lines.append("#SBATCH --exclusive")
+            elif val is not None:
+                lines.append(f"#SBATCH --exclusive={val}")
+
         # Array specification
         # If jobs_limit is specified and less than number of tasks, use it
         if jobs_limit is not None and jobs_limit > 0 and jobs_limit < len(tasks):
@@ -2005,6 +2140,27 @@ class SlurmExecutor(Executor):
         if self.array_throttle is not None and self.array_throttle > 0:
             array_spec += f"%{self.array_throttle}"
         lines.append(f"#SBATCH --array={array_spec}")
+        
+        # Generic pass-through for any remaining config keys
+        emitted = {
+            'job_name', 'output', 'error', 'separate_error', 'chdir',
+            'dependency', 'partition', 'time', 'account', 'qos', 'nodes',
+            'ntasks', 'cpus_per_task', 'mem', 'mem_per_cpu', 'gpus', 'gres',
+            'constraint', 'exclude', 'nodelist', 'requeue', 'signal',
+            'open_mode', 'mail_type', 'mail_user', 'exclusive'
+        }
+        for k, v in config.items():
+            if k in emitted or k == 'array':
+                continue
+            # Skip internal/meta fields
+            if k.startswith('_'):
+                continue
+            opt = k.replace('_', '-')
+            if isinstance(v, bool):
+                if v:
+                    lines.append(f"#SBATCH --{opt}")
+            elif v is not None:
+                lines.append(f"#SBATCH --{opt}={v}")
         
         return lines
 
@@ -2161,89 +2317,29 @@ class SlurmExecutor(Executor):
             raise RuntimeError(f"Error submitting sbatch script: {e}") from e
 
     def _print_dry_run_summary(self) -> None:
-        """Print a nice summary of jobs that would be submitted in dry run mode."""
+        """Print a nicely formatted summary of dry-run jobs."""
         if not self._dry_run_jobs:
             print("\nNo jobs to submit.\n", file=sys.stderr)
             return
-        
+
         print("\n" + "=" * 100, file=sys.stderr)
-        print("DRY RUN SUMMARY", file=sys.stderr)
+        print("DRY RUN - Job Submission Plan", file=sys.stderr)
         print("=" * 100 + "\n", file=sys.stderr)
-        
+
         # Overall statistics
         total_jobs = len(self._dry_run_jobs)
         total_tasks = sum(job['num_tasks'] for job in self._dry_run_jobs)
         total_complete = sum(job.get('num_complete', 0) for job in self._dry_run_jobs)
         total_remaining = sum(job.get('num_remaining', 0) for job in self._dry_run_jobs)
-        
+
         print(f"Total jobs: {total_jobs}", file=sys.stderr)
         print(f"Total tasks: {total_tasks}", file=sys.stderr)
-        print(f"Complete: {total_complete}, Remaining: {total_remaining}", file=sys.stderr)
-        print(file=sys.stderr)
-        
-        # Count artifacts by class
-        artifact_counts: Dict[str, int] = defaultdict(int)
+        print(f"Complete: {total_complete}, Remaining: {total_remaining}\n", file=sys.stderr)
+
+        # Render each job as a box
         for job in self._dry_run_jobs:
-            for artifact_class in job['artifact_classes']:
-                artifact_counts[artifact_class] += 1
-        
-        if artifact_counts:
-            print("Artifact types:", file=sys.stderr)
-            for artifact_class, count in sorted(artifact_counts.items()):
-                print(f"  {artifact_class}: {count} task(s)", file=sys.stderr)
-            print(file=sys.stderr)
-        
-        # List jobs by tier
-        jobs_by_tier: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
-        for job in self._dry_run_jobs:
-            jobs_by_tier[job['tier']].append(job)
-        
-        print("Job submission plan:", file=sys.stderr)
-        print(file=sys.stderr)
-        
-        for tier_index in sorted(jobs_by_tier.keys()):
-            tier_jobs = jobs_by_tier[tier_index]
-            print(f"Tier {tier_index}:", file=sys.stderr)
-            
-            for job in tier_jobs:
-                print(f"  Job {job['job_id']}: {job['job_name']}", file=sys.stderr)
-                
-                # Show stage if available
-                if job.get('stage'):
-                    print(f"    Stage: {job['stage']}", file=sys.stderr)
-                
-                print(f"    Tasks: {job['num_tasks']}", file=sys.stderr)
-                
-                # Show unique artifact types in this job
-                unique_artifacts = sorted(set(job['artifact_classes']))
-                if unique_artifacts:
-                    print(f"    Artifacts: {', '.join(unique_artifacts)}", file=sys.stderr)
-                
-                # Show key resource requirements
-                config = job['config']
-                resources = []
-                if config.get('partition'):
-                    resources.append(f"partition={config['partition']}")
-                if config.get('cpus'):
-                    resources.append(f"cpus={config['cpus']}")
-                if config.get('gpus'):
-                    resources.append(f"gpus={config['gpus']}")
-                if config.get('time'):
-                    resources.append(f"time={config['time']}")
-                
-                if resources:
-                    print(f"    Resources: {', '.join(resources)}", file=sys.stderr)
-                
-                # Show dependencies
-                if job['dependencies']:
-                    deps_str = ', '.join(job['dependencies'])
-                    print(f"    Dependencies: {deps_str}", file=sys.stderr)
-                else:
-                    print(f"    Dependencies: None (first tier)", file=sys.stderr)
-                
-                print(f"    Script: {job['script_path']}", file=sys.stderr)
-                print(file=sys.stderr)
-        
+            self._print_job_box(job, dry_run=True)
+
         print("=" * 100, file=sys.stderr)
         print("To actually submit these jobs, run without the --dry flag", file=sys.stderr)
         print("=" * 100 + "\n", file=sys.stderr)
@@ -2264,6 +2360,58 @@ class SlurmExecutor(Executor):
         print("Use 'python <script> history' to view full details", file=sys.stderr)
         print("Use 'python <script> cat <job_id>' to view logs", file=sys.stderr)
         print("=" * 80 + "\n", file=sys.stderr)
+
+    # ---- Pretty printing helpers ----
+    def _gpu_brief(self, config: Dict[str, Any]) -> str:
+        s = config.get('_gpu_summary') or {}
+        parts: List[str] = []
+        if s.get('gpus') is not None:
+            parts.append(f"gpus={s['gpus']}")
+        if s.get('gpus_per_node') is not None:
+            parts.append(f"gpn={s['gpus_per_node']}")
+        if s.get('gpus_per_task') is not None:
+            parts.append(f"gpt={s['gpus_per_task']}")
+        if s.get('cpus_per_gpu') is not None:
+            parts.append(f"cpug={s['cpus_per_gpu']}")
+        if s.get('mem_per_gpu') is not None:
+            parts.append(f"memg={s['mem_per_gpu']}")
+        if s.get('types'):
+            typelist = ','.join(f"{k}:{v}" for k, v in sorted(s['types'].items()))
+            parts.append(f"types={typelist}")
+        if not parts and 'gres' in config:
+            parts.append(f"gres={config['gres']}")
+        return ' '.join(parts)
+
+    def _print_job_box(self, job: Dict[str, Any], dry_run: bool = False) -> None:
+        job_id = job.get('job_id', 'N/A')
+        name = job.get('job_name', 'N/A')
+        stage = job.get('stage') or 'N/A'
+        num_tasks = job.get('num_tasks', 'N/A')
+        artifact_classes = sorted(set(job.get('artifact_classes', [])))
+        artifacts = ', '.join(artifact_classes) if artifact_classes else 'N/A'
+        conf = job.get('config', {})
+        deps = job.get('dependencies', []) or []
+        script = job.get('script_path', 'N/A')
+        log = job.get('log_file', 'N/A')
+        gpu = self._gpu_brief(conf)
+        exclusive = conf.get('exclusive', False)
+
+        header = f"✓ {'DRY ' if dry_run else ''}Job {job_id}: {name}"
+        line = '─' * max(60, len(header) + 2)
+        print(line, file=sys.stderr)
+        print(header, file=sys.stderr)
+        print(f"Stage: {stage}  |  Tasks: {num_tasks}  |  Deps: {len(deps)}", file=sys.stderr)
+        print(f"Partition: {conf.get('partition','N/A')}  Time: {conf.get('time','N/A')}  QoS: {conf.get('qos','N/A')}", file=sys.stderr)
+        print(f"CPUs/Task: {conf.get('cpus_per_task','N/A')}  Mem: {conf.get('mem') or conf.get('mem_per_cpu','N/A')}", file=sys.stderr)
+        if gpu:
+            print(f"GPU: {gpu}", file=sys.stderr)
+        if exclusive:
+            excl_str = "exclusive" if exclusive is True else f"exclusive={exclusive}"
+            print(f"Node access: {excl_str}", file=sys.stderr)
+        print(f"Logs: {os.path.basename(log) if isinstance(log,str) else log}", file=sys.stderr)
+        print(f"Artifacts: {artifacts}", file=sys.stderr)
+        print(f"Script: {script}", file=sys.stderr)
+        print(line, file=sys.stderr)
 
 
 # ---- Helpers for JSON-safe serialization ----
