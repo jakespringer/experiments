@@ -82,7 +82,7 @@ def parse_args():
     )
     parser.add_argument(
         "--job-name", "-J",
-        default="interactive",
+        default="i",
         help="Job name",
     )
     parser.add_argument(
@@ -198,9 +198,12 @@ def build_sbatch_script(args):
         exclude_nodes.extend(args.exclude.split(","))
     if exclude_nodes:
         lines.append(f"#SBATCH --exclude={','.join(exclude_nodes)}")
+
+    # Default to 1 node. Future: Implement multi-node support.
+    lines.append(f"#SBATCH --nodes=1")
     
     # Output file
-    lines.append(f"#SBATCH --output={args.job_name}_%j.log")
+    lines.append(f"#SBATCH --output=/tmp/{args.job_name}_%j.log")
     
     # Script body - sleep for the duration
     sleep_seconds = time_to_seconds(time_limit)

@@ -1777,7 +1777,7 @@ class SlurmExecutor(Executor):
         # Log files
         'output', 'error', 'separate_error',
         # Basic specifications
-        'partition', 'time', 'account', 'qos', 'chdir',
+        'partition', 'time', 'time_min', 'account', 'qos', 'chdir',
         # Node and task resources
         'nodes', 'ntasks', 'cpus', 'cpus_per_task',
         # Memory
@@ -1913,6 +1913,11 @@ class SlurmExecutor(Executor):
 
         # Normalize keys/values and special mappings
         config = _normalize_slurm_config(config)
+
+        # Default to single-node jobs unless explicitly overridden.
+        # Use 1 even if an upstream layer provided None.
+        if config.get('nodes') is None:
+            config['nodes'] = 1
 
         # Set default cpus_per_task based on GPUs if not specified
         if 'cpus_per_task' not in config and 'gpus' in config:
@@ -2069,6 +2074,8 @@ class SlurmExecutor(Executor):
             lines.append(f"#SBATCH --partition={config['partition']}")
         if 'time' in config:
             lines.append(f"#SBATCH --time={config['time']}")
+        if 'time_min' in config:
+            lines.append(f"#SBATCH --time-min={config['time_min']}")
         if 'account' in config:
             lines.append(f"#SBATCH --account={config['account']}")
         if 'qos' in config:
@@ -2144,7 +2151,7 @@ class SlurmExecutor(Executor):
         # Generic pass-through for any remaining config keys
         emitted = {
             'job_name', 'output', 'error', 'separate_error', 'chdir',
-            'dependency', 'partition', 'time', 'account', 'qos', 'nodes',
+            'dependency', 'partition', 'time', 'time_min', 'account', 'qos', 'nodes',
             'ntasks', 'cpus_per_task', 'mem', 'mem_per_cpu', 'gpus', 'gres',
             'constraint', 'exclude', 'nodelist', 'requeue', 'signal',
             'open_mode', 'mail_type', 'mail_user', 'exclusive'
@@ -2401,7 +2408,10 @@ class SlurmExecutor(Executor):
         print(line, file=sys.stderr)
         print(header, file=sys.stderr)
         print(f"Stage: {stage}  |  Tasks: {num_tasks}  |  Deps: {len(deps)}", file=sys.stderr)
-        print(f"Partition: {conf.get('partition','N/A')}  Time: {conf.get('time','N/A')}  QoS: {conf.get('qos','N/A')}", file=sys.stderr)
+        time_str = conf.get('time', 'N/A')
+        time_min_str = conf.get('time_min')
+        time_disp = f"{time_str} (min={time_min_str})" if time_min_str else str(time_str)
+        print(f"Partition: {conf.get('partition','N/A')}  Time: {time_disp}  QoS: {conf.get('qos','N/A')}", file=sys.stderr)
         print(f"CPUs/Task: {conf.get('cpus_per_task','N/A')}  Mem: {conf.get('mem') or conf.get('mem_per_cpu','N/A')}", file=sys.stderr)
         if gpu:
             print(f"GPU: {gpu}", file=sys.stderr)
