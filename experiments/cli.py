@@ -397,9 +397,14 @@ class ExperimentCLI:
             help='Artifact class names to include (filters by type)'
         )
         export_parser.add_argument(
+            '--check_exists',
+            action='store_true',
+            help='Evaluate artifact.exists (may do I/O / be slow); without this, "exists" is exported as null'
+        )
+        export_parser.add_argument(
             '--exists',
             action='store_true',
-            help='Only export artifacts that exist'
+            help='Only export artifacts that exist (requires --check_exists)'
         )
         export_parser.add_argument(
             '-f', '--file',
@@ -478,7 +483,13 @@ class ExperimentCLI:
         elif args.command == 'printlines':
             self.print_lines(args.stages, head=getattr(args, 'head', None), tail=getattr(args, 'tail', None), rerun=getattr(args, 'rerun', False), reverse=getattr(args, 'reverse', False), exclude=getattr(args, 'exclude', None), artifacts=getattr(args, 'artifact', None), jobs=getattr(args, 'jobs', None), output_dir=getattr(args, 'output_dir', None))
         elif args.command == 'export':
-            self.export(args.stages, artifacts=getattr(args, 'artifact', None), exists_only=getattr(args, 'exists', False), output_file=args.file)
+            self.export(
+                args.stages,
+                artifacts=getattr(args, 'artifact', None),
+                exists_only=getattr(args, 'exists', False),
+                check_exists=getattr(args, 'check_exists', False),
+                output_file=args.file,
+            )
     
     def launch(self, stages: List[str], dry_run: bool = False, head: Optional[int] = None, tail: Optional[int] = None, rerun: bool = False, reverse: bool = False, exclude: Optional[List[str]] = None, artifacts: Optional[List[str]] = None, jobs: Optional[int] = None, dependency: Optional[List[str]] = None, slurm_overrides: Optional[List[str]] = None, force_launch: bool = False, throttle: Optional[int] = None, split_jobs: Optional[int] = None) -> None:
         """Launch experiment stages."""
@@ -975,18 +986,64 @@ class ExperimentCLI:
                 
                 task_index += 1
     
-    def export(self, stages: List[str], artifacts: Optional[List[str]] = None, exists_only: bool = False, output_file: str = None) -> None:
+    def export(
+        self,
+        stages: List[str],
+        artifacts: Optional[List[str]] = None,
+        exists_only: bool = False,
+        check_exists: bool = False,
+        output_file: str = None,
+    ) -> None:
         """Export project configuration and artifacts to JSON file.
         
         Args:
             stages: List of stage names to export (empty for all)
             artifacts: Optional list of artifact class names to filter by
             exists_only: If True, only export artifacts that exist
+            check_exists: If True, evaluates artifact.exists and includes it in output
             output_file: Path to output JSON file
         """
         if not output_file:
             print("Error: Output file is required", file=sys.stderr)
             sys.exit(1)
+
+        if exists_only and not check_exists:
+            print("Error: --exists requires --check_exists", file=sys.stderr)
+            sys.exit(1)
+
+        def make_progress(label: str, total: int):
+            enabled = total > 0 and sys.stderr.isatty()
+            bar_width = 30
+            last_len = 0
+
+            def update(i: int, current: Optional[str] = None) -> None:
+                nonlocal last_len
+                if not enabled:
+                    return
+                i = max(0, min(i, total))
+                frac = i / total if total else 1.0
+                filled = int(round(frac * bar_width))
+                filled = max(0, min(filled, bar_width))
+                bar = "#" * filled + "-" * (bar_width - filled)
+                cur = ""
+                if current:
+                    cur_s = str(current).strip().replace("\n", " ")
+                    if len(cur_s) > 48:
+                        cur_s = cur_s[:45] + "..."
+                    cur = f" ({cur_s})"
+                s = f"\r{label}{cur} [{bar}] {i}/{total} ({int(frac * 100):3d}%)"
+                pad = " " * max(0, last_len - len(s))
+                sys.stderr.write(s + pad)
+                sys.stderr.flush()
+                last_len = len(s)
+
+            def close() -> None:
+                if not enabled:
+                    return
+                sys.stderr.write("\n")
+                sys.stderr.flush()
+
+            return update, close
         
         # Determine which stages to export
         selected_stages = stages if stages else list(self.executor._stages.keys())
@@ -1023,9 +1080,24 @@ class ExperimentCLI:
                 if a.__class__.__name__ in artifact_class_set
             ]
         
+        # Optionally compute existence once (artifact.exists may do I/O)
+        exists_by_id: Dict[int, Optional[bool]] = {}
+        if check_exists:
+            exists_progress_update, exists_progress_close = make_progress("Checking exists", len(unique_artifacts))
+            exists_progress_update(0)
+            try:
+                for i, a in enumerate(unique_artifacts, start=1):
+                    try:
+                        exists_by_id[id(a)] = bool(a.exists)
+                    except Exception:
+                        exists_by_id[id(a)] = None
+                    exists_progress_update(i, a.__class__.__name__)
+            finally:
+                exists_progress_close()
+
         # Filter by exists if specified
         if exists_only:
-            unique_artifacts = [a for a in unique_artifacts if a.exists]
+            unique_artifacts = [a for a in unique_artifacts if exists_by_id.get(id(a)) is True]
         
         # Import Artifact for type checking
         from .artifact import Artifact as ArtifactBase, ArtifactSet
@@ -1073,37 +1145,48 @@ class ExperimentCLI:
         
         # Export artifacts
         exported_artifacts = []
-        for artifact in unique_artifacts:
-            artifact_id = id(artifact)
-            artifact_dict = {
-                'stage': artifact_to_stages.get(artifact_id, []),
-                'artifact_type': artifact.__class__.__name__,
-                'hash': artifact.get_hash(),
-            }
-            
-            # Get data from as_dict()
-            try:
-                as_dict_data = artifact.as_dict()
-                for key, value in as_dict_data.items():
-                    artifact_dict[key] = safe_json_value(value)
-            except Exception as e:
-                artifact_dict['_as_dict_error'] = str(e)
-            
-            # Get @property attributes
-            for attr_name in dir(artifact.__class__):
+        export_progress_update, export_progress_close = make_progress("Exporting artifacts", len(unique_artifacts))
+        export_progress_update(0)
+        try:
+            for i, artifact in enumerate(unique_artifacts, start=1):
+                artifact_id = id(artifact)
+                artifact_dict = {
+                    'stage': artifact_to_stages.get(artifact_id, []),
+                    'artifact_type': artifact.__class__.__name__,
+                    'hash': artifact.get_hash(),
+                }
+                
+                # Get data from as_dict()
                 try:
-                    attr_value = getattr(artifact.__class__, attr_name)
-                    if isinstance(attr_value, property):
-                        # Try to get the property value
-                        try:
-                            prop_value = getattr(artifact, attr_name)
-                            artifact_dict[attr_name] = safe_json_value(prop_value)
-                        except Exception:
-                            artifact_dict[attr_name] = None
-                except:
-                    pass
-            
-            exported_artifacts.append(artifact_dict)
+                    as_dict_data = artifact.as_dict()
+                    for key, value in as_dict_data.items():
+                        artifact_dict[key] = safe_json_value(value)
+                except Exception as e:
+                    artifact_dict['_as_dict_error'] = str(e)
+
+                # Export existence info without forcing a check unless requested
+                artifact_dict['exists'] = exists_by_id.get(artifact_id) if check_exists else None
+                
+                # Get @property attributes
+                for attr_name in dir(artifact.__class__):
+                    try:
+                        if attr_name == "exists":
+                            continue
+                        attr_value = getattr(artifact.__class__, attr_name)
+                        if isinstance(attr_value, property):
+                            # Try to get the property value
+                            try:
+                                prop_value = getattr(artifact, attr_name)
+                                artifact_dict[attr_name] = safe_json_value(prop_value)
+                            except Exception:
+                                artifact_dict[attr_name] = None
+                    except:
+                        pass
+                
+                exported_artifacts.append(artifact_dict)
+                export_progress_update(i, artifact.__class__.__name__)
+        finally:
+            export_progress_close()
         
         # Build export data
         export_data = {
@@ -1156,6 +1239,8 @@ class ExperimentCLI:
             print(f"  Filtered by artifact types: {', '.join(artifacts)}", file=sys.stderr)
         if exists_only:
             print(f"  Filtered to only existing artifacts", file=sys.stderr)
+        if check_exists and not exists_only:
+            print(f"  Checked artifact existence", file=sys.stderr)
         print(f"  Stages: {', '.join(selected_stages)}", file=sys.stderr)
 
 

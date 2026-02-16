@@ -58,6 +58,10 @@ class Artifact:
             return {k: v for k, v in vars(self).items() if not k.startswith("_")}
 
     def get_hash(self) -> str:
+        cached = getattr(self, "_experiments_hash_cache", None)
+        if isinstance(cached, str) and cached:
+            return cached
+
         data = self.as_dict()
         
         from .executor import Directive, IgnoreHash
@@ -103,7 +107,12 @@ class Artifact:
         items = [(k, a) for k, v in data.items() if (a := atom(v)) is not None]
         items.sort(key=lambda kv: kv[0])
         payload = '|'.join(f"{k}={v}" for k, v in items)
-        return hashlib.sha256(payload.encode('utf-8')).hexdigest()[:10]
+        h = hashlib.sha256(payload.encode('utf-8')).hexdigest()[:10]
+        try:
+            setattr(self, "_experiments_hash_cache", h)
+        except Exception:
+            pass
+        return h
 
 class ArtifactSet(Sequence[Any]):
     """A collection wrapper with simple functional utilities.

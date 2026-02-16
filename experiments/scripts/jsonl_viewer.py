@@ -28,6 +28,7 @@ try:
     from rich.style import Style
     from rich.box import ROUNDED, DOUBLE, HEAVY, MINIMAL
     from rich import box
+    from rich.markup import escape
 except ImportError:
     print("Installing required package: rich")
     import subprocess
@@ -39,6 +40,7 @@ except ImportError:
     from rich.style import Style
     from rich.box import ROUNDED, DOUBLE, HEAVY, MINIMAL
     from rich import box
+    from rich.markup import escape
 
 # Platform-specific imports for keyboard handling
 if sys.platform == 'win32':
@@ -194,17 +196,17 @@ class JSONLViewer:
             box=box.ROUNDED,
             border_style=Style(color=self.COLORS['border']),
             header_style=Style(color=self.COLORS['header_fg'], bgcolor=self.COLORS['header_bg'], bold=True),
-            title=f"[bold {self.COLORS['accent']}]📄 {self.filepath.name}[/]",
+            title=f"[bold {self.COLORS['accent']}]📄 {escape(self.filepath.name)}[/]",
             title_style=Style(color=self.COLORS['accent']),
             show_lines=True,
             pad_edge=True,
             expand=True,
         )
         
-        # Add columns
+        # Add columns (escape column names in case they contain brackets)
         for col in self.columns:
             table.add_column(
-                col,
+                escape(col),
                 width=col_widths.get(col, 20),
                 overflow='fold',
                 style=Style(color=self.COLORS['text']),
@@ -217,7 +219,8 @@ class JSONLViewer:
             row_values = []
             for col in self.columns:
                 value = self.format_value(record.get(col, ''))
-                row_values.append(value)
+                # Escape the value to prevent Rich markup interpretation
+                row_values.append(escape(value))
             
             table.add_row(*row_values, style=Style(bgcolor=row_style))
         
@@ -252,7 +255,7 @@ class JSONLViewer:
         return (
             f"[{self.COLORS['accent']}]Lines {start}-{end} of {total_lines}[/] │ "
             f"[{self.COLORS['muted']}]{len(self.records)} records[/] │ "
-            f"[{self.COLORS['muted']}][{scroll_indicator}][/] │ "
+            f"[{self.COLORS['muted']}]\\[{scroll_indicator}][/] │ "
             f"[{self.COLORS['success']}]↑↓[/] Scroll  "
             f"[{self.COLORS['warning']}]PgUp/PgDn[/] Page  "
             f"[{self.COLORS['highlight']}]Home/End[/] Jump  "
@@ -262,14 +265,14 @@ class JSONLViewer:
     def show_error(self, message: str):
         """Display an error message."""
         self.console.print(Panel(
-            f"[bold red]✖ Error:[/] {message}",
+            f"[bold red]✖ Error:[/] {escape(message)}",
             border_style="red",
             box=ROUNDED
         ))
     
     def show_warning(self, message: str):
         """Display a warning message."""
-        self.console.print(f"[yellow]⚠ {message}[/]")
+        self.console.print(f"[yellow]⚠ {escape(message)}[/]")
     
     def get_key(self) -> str:
         """Get a single keypress from the user."""
