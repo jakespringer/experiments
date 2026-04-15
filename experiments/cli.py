@@ -110,7 +110,13 @@ class ExperimentCLI:
             metavar='N',
             help='Split large array submissions into multiple sbatch calls with at most N indices per submission'
         )
-        
+        launch_parser.add_argument(
+            '--autobatch',
+            type=int,
+            metavar='N',
+            help='Automatically batch every N artifacts within each stage to run in parallel on a single job'
+        )
+
         # drylaunch command
         drylaunch_parser = subparsers.add_parser('drylaunch', help='Dry run: show what would be launched')
         drylaunch_parser.add_argument(
@@ -182,7 +188,13 @@ class ExperimentCLI:
             metavar='N',
             help='Split large array submissions into multiple sbatch calls with at most N indices per submission'
         )
-        
+        drylaunch_parser.add_argument(
+            '--autobatch',
+            type=int,
+            metavar='N',
+            help='Automatically batch every N artifacts within each stage to run in parallel on a single job'
+        )
+
         # relaunch command
         relaunch_parser = subparsers.add_parser('relaunch', help='Cancel and relaunch experiment stages')
         relaunch_parser.add_argument(
@@ -264,7 +276,13 @@ class ExperimentCLI:
             action='store_true',
             help='Cancel previous jobs after launching new ones (default: cancel before)'
         )
-        
+        relaunch_parser.add_argument(
+            '--autobatch',
+            type=int,
+            metavar='N',
+            help='Automatically batch every N artifacts within each stage to run in parallel on a single job'
+        )
+
         # cancel command
         cancel_parser = subparsers.add_parser('cancel', help='Cancel jobs for stages')
         cancel_parser.add_argument(
@@ -437,6 +455,7 @@ class ExperimentCLI:
                 force_launch=getattr(args, 'force_launch', False),
                 throttle=getattr(args, 'throttle', None),
                 split_jobs=getattr(args, 'splitjobs', None),
+                autobatch=getattr(args, 'autobatch', None),
             )
         elif args.command == 'drylaunch':
             self.launch(
@@ -454,6 +473,7 @@ class ExperimentCLI:
                 force_launch=False,
                 throttle=getattr(args, 'throttle', None),
                 split_jobs=getattr(args, 'splitjobs', None),
+                autobatch=getattr(args, 'autobatch', None),
             )
         elif args.command == 'relaunch':
             self.relaunch(
@@ -471,6 +491,7 @@ class ExperimentCLI:
                 throttle=getattr(args, 'throttle', None),
                 split_jobs=getattr(args, 'splitjobs', None),
                 cancel_after=getattr(args, 'cancelafter', False),
+                autobatch=getattr(args, 'autobatch', None),
             )
         elif args.command == 'cancel':
             self.cancel(args.stages)
@@ -491,12 +512,30 @@ class ExperimentCLI:
                 output_file=args.file,
             )
     
-    def launch(self, stages: List[str], dry_run: bool = False, head: Optional[int] = None, tail: Optional[int] = None, rerun: bool = False, reverse: bool = False, exclude: Optional[List[str]] = None, artifacts: Optional[List[str]] = None, jobs: Optional[int] = None, dependency: Optional[List[str]] = None, slurm_overrides: Optional[List[str]] = None, force_launch: bool = False, throttle: Optional[int] = None, split_jobs: Optional[int] = None) -> None:
-        """Launch experiment stages."""
-        # Apply config settings to executor
+    def _prepare_launch(
+        self,
+        stages: List[str],
+        dry_run: bool = False,
+        reverse: bool = False,
+        exclude: Optional[List[str]] = None,
+        rerun: bool = False,
+        autobatch: Optional[int] = None,
+        jobs: Optional[int] = None,
+        dependency: Optional[List[str]] = None,
+        slurm_overrides: Optional[List[str]] = None,
+        force_launch: bool = False,
+        throttle: Optional[int] = None,
+        split_jobs: Optional[int] = None,
+    ) -> List[str]:
+        """Configure the executor and return resolved stage names.
+
+        This does all the work that can happen *before* sbatch submission:
+        slurm override parsing, autobatching, stage resolution.  The caller
+        can then do ``self.executor.execute(selected, ...)`` when ready.
+        """
         self.executor.dry_run = dry_run
-        
-        # Apply CLI slurm overrides (highest priority)
+
+        # --- Parse CLI slurm overrides ---
         def _norm_key(k: str) -> str:
             return k.strip().lower().replace('-', '_')
         def _to_bool(v: str) -> Any:
@@ -508,58 +547,121 @@ class ExperimentCLI:
             return int(v) if v.isdigit() else v
         overrides: Dict[str, Any] = {}
         if slurm_overrides:
+            tokens = []
             for item in slurm_overrides:
-                if '=' in item:
-                    k, v = item.split('=', 1)
+                tokens.extend(item.split())
+            for token in tokens:
+                if '=' in token:
+                    k, v = token.split('=', 1)
                     nk = _norm_key(k)
                     if nk == 'array':
                         print("Error: --slurm array=... is not supported. Arrays are managed by the executor.", file=sys.stderr)
                         sys.exit(1)
-                    # basic coercion
                     vv: Any = _to_bool(v)
                     if isinstance(vv, str):
                         vv = _to_int_if_numeric(vv)
                     overrides[nk] = vv
-        
-        # Handle throttle: CLI --throttle takes precedence over --slurm throttle=N
+
+        # --- Throttle ---
         throttle_value = None
         if throttle is not None:
-            # Explicit --throttle flag has highest priority
             throttle_value = throttle
         elif 'throttle' in overrides:
-            # Fall back to --slurm throttle=N
             try:
                 throttle_value = int(overrides['throttle'])
             except (ValueError, TypeError):
                 pass
-            # Remove from overrides since we handle it separately
             overrides.pop('throttle', None)
-        
+
         if hasattr(self.executor, 'cli_slurm_overrides'):
             self.executor.cli_slurm_overrides = overrides
         if hasattr(self.executor, 'force_launch'):
             self.executor.force_launch = bool(force_launch)
         if hasattr(self.executor, 'array_throttle'):
             self.executor.array_throttle = throttle_value
-        # Set split_jobs on the executor
         if hasattr(self.executor, 'split_jobs'):
             self.executor.split_jobs = split_jobs
-        
-        # Set external dependencies on the executor
         if hasattr(self.executor, 'external_dependencies'):
             self.executor.external_dependencies = dependency or []
-        
-        # Execute stages
+
+        # --- Resolve stages ---
         selected = stages if stages else list(self.executor._stages.keys())
-        
-        # Exclude specified stages
         if exclude:
             selected = [s for s in selected if s not in exclude]
-        
         if reverse:
             selected = list(reversed(selected))
+
+        # --- Autobatch ---
+        if autobatch is not None and autobatch > 1:
+            self._apply_autobatch(selected, autobatch, rerun=rerun)
+
+        return selected
+
+    def launch(self, stages: List[str], dry_run: bool = False, head: Optional[int] = None, tail: Optional[int] = None, rerun: bool = False, reverse: bool = False, exclude: Optional[List[str]] = None, artifacts: Optional[List[str]] = None, jobs: Optional[int] = None, dependency: Optional[List[str]] = None, slurm_overrides: Optional[List[str]] = None, force_launch: bool = False, throttle: Optional[int] = None, split_jobs: Optional[int] = None, autobatch: Optional[int] = None) -> None:
+        """Launch experiment stages."""
+        selected = self._prepare_launch(
+            stages, dry_run=dry_run, reverse=reverse, exclude=exclude,
+            rerun=rerun, autobatch=autobatch, jobs=jobs, dependency=dependency,
+            slurm_overrides=slurm_overrides, force_launch=force_launch,
+            throttle=throttle, split_jobs=split_jobs,
+        )
         self.executor.execute(selected, head=head, tail=tail, rerun=rerun, artifacts=artifacts, jobs=jobs)
-    
+
+    def _apply_autobatch(self, selected_stages: List[str], batch_size: int, rerun: bool = False) -> None:
+        """Replace artifacts in selected stages with ArtifactBatch groups.
+
+        Only non-skippable artifacts are batched together.  Artifacts that
+        should be skipped (already exist) are dropped from the stage entirely
+        — the executor's own skip logic would remove them anyway, and
+        excluding them here prevents wasting batch slots on no-ops.
+        """
+        from .batch import ArtifactBatch
+
+        total_batches = 0
+        total_singles = 0
+
+        for stage_name in selected_stages:
+            if stage_name not in self.executor._stages:
+                continue
+            artifacts = self.executor._stages[stage_name]
+            if len(artifacts) <= 1:
+                continue
+
+            # Separate runnable vs skippable artifacts.
+            # Skipped artifacts are kept in the stage (unbatched) so that
+            # downstream artifacts can still resolve them as dependencies.
+            if rerun:
+                runnable = list(artifacts)
+                skipped: list = []
+            else:
+                runnable = [a for a in artifacts if not a.should_skip()]
+                skipped = [a for a in artifacts if a.should_skip()]
+
+            if not runnable:
+                # All skipped — keep them so dependency resolution still works
+                self.executor._stages[stage_name] = skipped
+                continue
+
+            batched = []
+            for i in range(0, len(runnable), batch_size):
+                chunk = runnable[i:i + batch_size]
+                if len(chunk) == 1:
+                    batched.append(chunk[0])
+                    total_singles += 1
+                else:
+                    batched.append(ArtifactBatch(chunk, batch_index=i // batch_size))
+                    total_batches += 1
+
+            self.executor._stages[stage_name] = batched + skipped
+
+        if total_batches or total_singles:
+            print(
+                f"Autobatch: created {total_batches} batch(es) and "
+                f"{total_singles} single artifact(s) across selected stages",
+                file=sys.stderr,
+            )
+            print(file=sys.stderr)
+
     def cancel(self, stages: List[str], exclude_job_ids: Optional[List[str]] = None) -> None:
         """Cancel jobs for the specified stages."""
         if not Project.name:
@@ -638,63 +740,36 @@ class ExperimentCLI:
         throttle: Optional[int] = None,
         split_jobs: Optional[int] = None,
         cancel_after: bool = False,
+        autobatch: Optional[int] = None,
     ) -> None:
         """Cancel and relaunch experiment stages.
-        
-        This method cancels jobs for the selected stages, then launches
-        the same stages with the provided launch options.
+
+        Default order (minimises dead time):
+          1. Prepare — resolve stages, autobatch, compile scripts
+          2. Cancel — scancel previous jobs
+          3. Submit — sbatch the already-prepared scripts
+
+        With ``--cancelafter`` the order is submit-then-cancel (for seamless
+        handoff when new jobs depend on old outputs).
         """
-        # Compute selected stages exactly like launch (respecting exclude and reverse)
-        selected = stages if stages else list(self.executor._stages.keys())
-        
-        # Exclude specified stages
-        if exclude:
-            selected = [s for s in selected if s not in exclude]
-        
-        if reverse:
-            selected = list(reversed(selected))
-        
+        # (1) Prepare: configure executor, resolve stages, autobatch,
+        #     and have the executor compile all scripts so they're ready.
+        selected = self._prepare_launch(
+            stages, dry_run=False, reverse=reverse, exclude=exclude,
+            rerun=rerun, autobatch=autobatch, jobs=jobs, dependency=dependency,
+            slurm_overrides=slurm_overrides, force_launch=force_launch,
+            throttle=throttle, split_jobs=split_jobs,
+        )
+
         if not cancel_after:
-            # Cancel only the selected stages first (default behavior)
+            # (2) Cancel
             self.cancel(selected)
-
-            # Then launch the same selected stages with provided options
-            self.launch(
-                selected,
-                dry_run=False,
-                head=head,
-                tail=tail,
-                rerun=rerun,
-                reverse=False,   # already applied
-                exclude=None,    # already applied
-                artifacts=artifacts,
-                jobs=jobs,
-                dependency=dependency,
-                slurm_overrides=slurm_overrides,
-                force_launch=force_launch,
-                throttle=throttle,
-                split_jobs=split_jobs,
-            )
+            # (3) Submit
+            self.executor.execute(selected, head=head, tail=tail, rerun=rerun, artifacts=artifacts, jobs=jobs)
         else:
-            # Launch first
-            self.launch(
-                selected,
-                dry_run=False,
-                head=head,
-                tail=tail,
-                rerun=rerun,
-                reverse=False,   # already applied
-                exclude=None,    # already applied
-                artifacts=artifacts,
-                jobs=jobs,
-                dependency=dependency,
-                slurm_overrides=slurm_overrides,
-                force_launch=force_launch,
-                throttle=throttle,
-                split_jobs=split_jobs,
-            )
-
-            # Then cancel previous jobs, excluding newly launched job IDs
+            # (3) Submit first
+            self.executor.execute(selected, head=head, tail=tail, rerun=rerun, artifacts=artifacts, jobs=jobs)
+            # (2) Cancel old jobs, excluding the ones we just launched
             recent_ids: List[str] = []
             if hasattr(self.executor, 'recent_job_ids'):
                 try:
@@ -705,26 +780,88 @@ class ExperimentCLI:
     
     def cat(self, job_spec: str, array_index: Optional[int] = None) -> None:
         """Print log file for a job.
-        
-        Args:
-            job_spec: Job ID or job_id_arrayindex (e.g., "12345" or "12345_0")
-            array_index: Optional array index if not in job_spec
+
+        Supports:
+            12345       → all array tasks for job 12345
+            12345_0     → array task 0
+            12345_0_3   → batch child 3 within array task 0
         """
-        # Parse job spec
+        # Parse job spec — handle up to three underscore-separated parts
+        child_index: Optional[int] = None
         if '_' in job_spec:
             parts = job_spec.split('_')
             job_id = parts[0]
             array_index = int(parts[1])
+            if len(parts) >= 3:
+                child_index = int(parts[2])
         else:
             job_id = job_spec
-        
+
         # Get log directory
         log_dir = Path(self.config.get('log_directory', str(Path.home() / ".experiments" / "logs")))
-        
+
         if not log_dir.exists():
             print(f"Log directory does not exist: {log_dir}")
             return
-        
+
+        # If child_index is specified, look for batch child log
+        if child_index is not None and array_index is not None:
+            child_log = log_dir / f"batch_{job_id}_{array_index}_child_{child_index}.out"
+            if child_log.exists():
+                try:
+                    with open(child_log, 'r') as f:
+                        content = f.read()
+                        print(content, end='')
+                        if content and not content.endswith('\n'):
+                            print()
+                except Exception as e:
+                    print(f"Error reading {child_log}: {e}")
+                return
+            else:
+                print(f"No batch child log found at {child_log}")
+
+                # Check Slurm job state for context
+                job_state = None
+                try:
+                    result = subprocess.run(
+                        ['scontrol', 'show', 'job', f'{job_id}_{array_index}'],
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    for token in result.stdout.split():
+                        if token.startswith('JobState='):
+                            job_state = token.split('=', 1)[1]
+                            break
+                except Exception:
+                    pass
+
+                if job_state:
+                    print(f"Job state: {job_state}")
+                if job_state in ('PENDING', 'CONFIGURING'):
+                    print(f"The child log will be created once the batch starts running.")
+                elif job_state == 'RUNNING':
+                    print(f"Job is running but child log was not created. Check main log for [batch] WARNING messages.")
+
+                # Check main Slurm log for batch diagnostic messages
+                main_logs = sorted(log_dir.glob(f"*_{job_id}_{array_index}.out"))
+                if main_logs:
+                    print(f"\nMain Slurm log: {main_logs[0].name}")
+                    try:
+                        with open(main_logs[0], 'r') as f:
+                            for line in f:
+                                if '[batch] WARNING' in line:
+                                    print(f"  {line.rstrip()}")
+                    except Exception:
+                        pass
+                    print(f"Use: cat {job_id}_{array_index}  (to see the full main log)")
+
+                # Show available child logs
+                available = sorted(log_dir.glob(f"batch_{job_id}_{array_index}_child_*.out"))
+                if available:
+                    print(f"\nAvailable child logs:")
+                    for f in available:
+                        print(f"  - {f.name}")
+                return
+
         # Find log files matching this job ID
         if array_index is not None:
             # Look for specific array task log
@@ -732,7 +869,7 @@ class ExperimentCLI:
         else:
             # Look for all logs for this job
             pattern = f"*_{job_id}_*.log"
-        
+
         matching_logs = sorted(log_dir.glob(pattern))
         
         if not matching_logs:

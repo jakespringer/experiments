@@ -94,12 +94,14 @@ class Task:
         code_path: str,
         artifact: Artifact | None = None,
         gs_path: str | None = None,
+        log_dir: str | None = None,
     ) -> None:
         self.blocks: List[TaskBlock] = []
         self.artifact_path = artifact_path
         self.gs_path = gs_path
         self.code_path = code_path
         self.artifact = artifact
+        self.log_dir = log_dir
     
     def create_file(self, path: str, content: str | bytes) -> None:
         """Add a file creation block to this task."""
@@ -137,9 +139,13 @@ class Task:
         """Add a Google Cloud Storage upload block to this task."""
         self.blocks.append(UploadToGSTaskBlock(path, gs_path, directory=directory, contents=contents, no_fail=no_fail))
 
-    def download_from_gs(self, gs_path: str, path: str, directory: bool = False, skip_existing: bool = True, contents: bool | None = True, no_fail: bool = False) -> None:
-        """Add a Google Cloud Storage download block to this task."""
-        self.blocks.append(DownloadFromGSTaskBlock(gs_path, path, directory=directory, skip_existing=skip_existing, contents=contents, no_fail=no_fail))
+    def download_from_gs(self, gs_path: str, path: str, directory: bool = False, skip_existing: bool = True, contents: bool | None = True, no_fail: bool = False, exclusive: bool = False) -> None:
+        """Add a Google Cloud Storage download block to this task.
+
+        ``exclusive=True`` makes this block contend for a shared host-wide
+        lockfile so at most one exclusive GCS download runs at a time.
+        """
+        self.blocks.append(DownloadFromGSTaskBlock(gs_path, path, directory=directory, skip_existing=skip_existing, contents=contents, no_fail=no_fail, exclusive=exclusive))
 
     def download(self, url: str, local_path: str, skip_existing: bool = True) -> None:
         """Add a web URL download block to this task."""
@@ -153,13 +159,29 @@ class Task:
         """Add a Hugging Face model download block to this task."""
         self.blocks.append(DownloadHFModelTaskBlock(model_name, local_dir, skip_existing=skip_existing))
 
-    def rsync_to_gs(self, path: str, gs_path: str, delete: bool = False, checksum: bool = False, contents: bool | None = True, check_exists: bool = False, no_fail: bool = False) -> None:
-        """Add a Google Cloud Storage rsync upload block to this task."""
-        self.blocks.append(RsyncToGSTaskBlock(path, gs_path, delete=delete, checksum=checksum, contents=contents, check_exists=check_exists, no_fail=no_fail))
+    def rsync_to_gs(self, path: str, gs_path: str, delete: bool = False, checksum: bool = False, contents: bool | None = True, check_exists: bool = False, no_fail: bool = False, exclude: str | Sequence[str] | None = None, dry_run: bool = False, verbose: bool = True) -> None:
+        """Add a Google Cloud Storage rsync upload block to this task.
 
-    def rsync_from_gs(self, gs_path: str, path: str, delete: bool = False, checksum: bool = False, skip_existing: bool = True, contents: bool | None = True, check_exists: bool = False, no_fail: bool = False) -> None:
-        """Add a Google Cloud Storage rsync download block to this task."""
-        self.blocks.append(RsyncFromGSTaskBlock(gs_path, path, delete=delete, checksum=checksum, skip_existing=skip_existing, contents=contents, check_exists=check_exists, no_fail=no_fail))
+        ``exclude`` is a Python regex (or sequence of regexes joined with ``|``)
+        passed to ``gsutil rsync -x`` to skip matching paths. ``dry_run`` maps
+        to ``gsutil rsync -n``. ``verbose`` defaults to True (gsutil's default
+        per-file progress output); pass ``verbose=False`` to add top-level
+        ``-q`` and suppress everything but errors.
+        """
+        self.blocks.append(RsyncToGSTaskBlock(path, gs_path, delete=delete, checksum=checksum, contents=contents, check_exists=check_exists, no_fail=no_fail, exclude=exclude, dry_run=dry_run, verbose=verbose))
+
+    def rsync_from_gs(self, gs_path: str, path: str, delete: bool = False, checksum: bool = False, skip_existing: bool = True, contents: bool | None = True, check_exists: bool = False, no_fail: bool = False, exclude: str | Sequence[str] | None = None, dry_run: bool = False, verbose: bool = True, exclusive: bool = False) -> None:
+        """Add a Google Cloud Storage rsync download block to this task.
+
+        ``exclude`` is a Python regex (or sequence of regexes joined with ``|``)
+        passed to ``gsutil rsync -x`` to skip matching paths. ``dry_run`` maps
+        to ``gsutil rsync -n``. ``verbose`` defaults to True (gsutil's default
+        per-file progress output); pass ``verbose=False`` to add top-level
+        ``-q`` and suppress everything but errors. ``exclusive=True`` makes
+        this block contend for a shared host-wide lockfile so at most one
+        exclusive GCS download runs at a time.
+        """
+        self.blocks.append(RsyncFromGSTaskBlock(gs_path, path, delete=delete, checksum=checksum, skip_existing=skip_existing, contents=contents, check_exists=check_exists, no_fail=no_fail, exclude=exclude, dry_run=dry_run, verbose=verbose, exclusive=exclusive))
 
     def set_env(self, name: str, value: str, from_command: bool = False) -> None:
         """Add an environment variable export block to this task.
@@ -332,6 +354,7 @@ class DownloadFromGSTaskBlock(TaskBlock):
         skip_existing: bool = True,
         contents: bool | None = True,
         no_fail: bool = False,
+        exclusive: bool = False,
     ) -> None:
         self.gs_path = gs_path  # Should be gs://bucket/path format
         self.path = path  # Local destination path
@@ -339,47 +362,68 @@ class DownloadFromGSTaskBlock(TaskBlock):
         self.skip_existing = skip_existing
         self.contents = contents  # If True, add trailing slashes; if False, remove; if None, leave
         self.no_fail = no_fail
+        # If True, hold the shared global GCS-download lock so at most one
+        # exclusive download runs concurrently on this host (strictly stronger
+        # than the per-path lock).
+        self.exclusive = exclusive
 
     def execute(self) -> str:
         """Generate a locked gsutil download command."""
-        # Create a lockfile based on the local path to prevent concurrent access
-        path_hash = hashlib.sha256(self.path.encode("utf-8")).hexdigest()[:10]
-        lockfile = f"/tmp/{path_hash}.lock"
+        # When exclusive, take the shared global lock so only one GCS download
+        # runs at a time host-wide; otherwise fall back to a per-path lock
+        # that only prevents races on the same local destination.
+        if self.exclusive:
+            lockfile = _GCS_DOWNLOAD_GLOBAL_LOCKFILE
+        else:
+            path_hash = hashlib.sha256(self.path.encode("utf-8")).hexdigest()[:10]
+            lockfile = f"/tmp/{path_hash}.lock"
 
-        # Build the inner command (mkdir + download)
-        inner_parts: List[str] = []
-
-        # Prepare source and destination paths, respecting contents flag
+        # Prepare source path, respecting contents flag
         source_path = self.gs_path
-        dest_path = self.path
         if self.directory:
             if self.contents is True:
-                # Copy contents: use wildcard on source, no trailing slash on dest
+                # Copy contents: use wildcard on source
                 source_path = source_path.rstrip('/') + '/*'
-                dest_path = dest_path.rstrip('/')
             elif self.contents is False:
                 source_path = source_path.rstrip('/')
-                dest_path = dest_path.rstrip('/')
 
-        # Create necessary directories before download
-        if self.directory:
-            inner_parts.append(f"mkdir -p -- {dquote(self.path.rstrip('/'))}")
-            # Use -m for parallel operations and -r for recursive
-            gsutil_cmd = f"gsutil -m cp -r {dquote(source_path)} {dquote(dest_path)}"
+        # Stage the download at a sibling path and atomically rename on success,
+        # so a failed download never leaves a partial/empty path behind. The
+        # enclosing flock serializes writers, so a fixed suffix is safe and
+        # also lets us scrub orphan staging paths from prior crashed runs.
+        final_dest = self.path.rstrip('/') if self.directory else self.path
+        tmp_dest = f"{final_dest}.part-download"
+
+        inner_parts: List[str] = []
+        # Always scrub stale staging path before starting
+        inner_parts.append(f"rm -rf -- {dquote(tmp_dest)}")
+        if self.directory and self.contents is True:
+            # gsutil cp -r SRC/* TMP requires TMP to exist
+            inner_parts.append(f"mkdir -p -- {dquote(tmp_dest)}")
         else:
-            parent = os.path.dirname(self.path) or "."
+            # Ensure the parent exists so gsutil can create TMP and mv can land
+            parent = os.path.dirname(final_dest) or "."
             inner_parts.append(f"mkdir -p -- {dquote(parent)}")
-            gsutil_cmd = f"gsutil cp {dquote(source_path)} {dquote(dest_path)}"
-        inner_parts.append(gsutil_cmd)
+        if self.directory:
+            # Use -m for parallel operations and -r for recursive
+            inner_parts.append(f"gsutil -m cp -r {dquote(source_path)} {dquote(tmp_dest)}")
+        else:
+            inner_parts.append(f"gsutil cp {dquote(source_path)} {dquote(tmp_dest)}")
+        inner_parts.append(f"mv -- {dquote(tmp_dest)} {dquote(final_dest)}")
 
         base_cmd = " && ".join(inner_parts)
+        # On failure, remove the staging path and propagate the failure
+        guarded_cmd = (
+            f"{{ {base_cmd}; }} || "
+            f"{{ rc=$?; rm -rf -- {dquote(tmp_dest)}; exit $rc; }}"
+        )
 
         # Wrap entire command in flock; when skip_existing is enabled, guard it with an
         # if/else block so only a pre-existing path causes a skip.
         if self.skip_existing:
             script_lines = [
                 f"if [ ! -e {dquote(self.path)} ]; then",
-                f"  {base_cmd}",
+                f"  {guarded_cmd}",
                 "else",
                 f"  echo \"Skipping download, {self.path} already exists\"",
                 "fi",
@@ -387,7 +431,7 @@ class DownloadFromGSTaskBlock(TaskBlock):
             inner_script = "\n".join(script_lines)
             locked_cmd = f"flock -x {dquote(lockfile)} -c {dquote(inner_script)}"
         else:
-            locked_cmd = f"flock -x {dquote(lockfile)} -c {dquote(base_cmd)}"
+            locked_cmd = f"flock -x {dquote(lockfile)} -c {dquote(guarded_cmd)}"
 
         if self.no_fail:
             return f"{locked_cmd} || true"
@@ -496,6 +540,33 @@ class DownloadHFModelTaskBlock(TaskBlock):
         return "\n".join(lines)
 
 
+# Shared lockfile used when a caller opts into single-flight GCS downloads:
+# any task block configured with ``exclusive=True`` holds this lock for the
+# duration of its transfer, so at most one such download runs at a time on
+# the host (regardless of local destination path).
+_GCS_DOWNLOAD_GLOBAL_LOCKFILE = "/tmp/gcs_download.global.lock"
+
+
+def _build_exclude_pattern(exclude: str | Sequence[str] | None) -> str | None:
+    """Combine one or more regex patterns into a single gsutil ``-x`` argument.
+
+    gsutil rsync's ``-x`` accepts a single Python regex matched against the
+    object's path relative to the source root. Multiple patterns are joined
+    with ``|`` alternation; each is wrapped in a non-capturing group so that
+    top-level alternation in a user pattern doesn't bleed across patterns.
+    """
+    if exclude is None:
+        return None
+    if isinstance(exclude, str):
+        return exclude or None
+    patterns = [p for p in exclude if p]
+    if not patterns:
+        return None
+    if len(patterns) == 1:
+        return patterns[0]
+    return "|".join(f"(?:{p})" for p in patterns)
+
+
 class RsyncToGSTaskBlock(TaskBlock):
     """Syncs a local directory to Google Cloud Storage using gsutil rsync with locking."""
 
@@ -508,6 +579,9 @@ class RsyncToGSTaskBlock(TaskBlock):
         contents: bool | None = None,
         check_exists: bool = False,
         no_fail: bool = False,
+        exclude: str | Sequence[str] | None = None,
+        dry_run: bool = False,
+        verbose: bool = True,
     ) -> None:
         self.path = path
         self.gs_path = gs_path  # Should be gs://bucket/path format
@@ -516,7 +590,10 @@ class RsyncToGSTaskBlock(TaskBlock):
         self.contents = contents  # If True, add trailing slashes; if False, remove them; if None, leave as-is
         self.check_exists = check_exists  # If True, only rsync if remote path exists
         self.no_fail = no_fail
-    
+        self.exclude = exclude  # Regex (or list of regexes) passed to gsutil rsync -x
+        self.dry_run = dry_run  # If True, run gsutil rsync in dry-run mode (-n)
+        self.verbose = verbose  # If False, pass top-level -q to gsutil (errors only)
+
     def execute(self) -> str:
         """Generate a locked gsutil rsync command."""
         # Create a lockfile based on the local path to prevent concurrent access
@@ -540,21 +617,30 @@ class RsyncToGSTaskBlock(TaskBlock):
 
         # Build the inner command (existence check + rsync)
         inner_parts = []
-        
+
         # If check_exists is enabled, check if the remote path exists
         if self.check_exists:
             inner_parts.append(f"gsutil -q ls {dquote(dest_path)} > /dev/null 2>&1")
-        
+
         # Build the gsutil rsync command
-        # -r for recursive sync, -m for parallel operations
-        gsutil_cmd_parts = ["gsutil", "-m", "rsync", "-r"]
-        
+        # -r for recursive sync, -m for parallel operations.
+        # Top-level -q suppresses per-file progress; omit it when verbose.
+        gsutil_cmd_parts = ["gsutil"]
+        if not self.verbose:
+            gsutil_cmd_parts.append("-q")
+        gsutil_cmd_parts.extend(["-m", "rsync", "-r"])
+
         # Add optional flags
         if self.delete:
             gsutil_cmd_parts.append("-d")  # Delete files in dest not in source
         if self.checksum:
             gsutil_cmd_parts.append("-c")  # Use checksum instead of mtime
-        
+        if self.dry_run:
+            gsutil_cmd_parts.append("-n")  # Dry-run (no side effects)
+        exclude_pattern = _build_exclude_pattern(self.exclude)
+        if exclude_pattern is not None:
+            gsutil_cmd_parts.extend(["-x", dquote(exclude_pattern)])
+
         # Add source and destination
         gsutil_cmd_parts.extend([dquote(source_path), dquote(dest_path)])
         gsutil_cmd = " ".join(gsutil_cmd_parts)
@@ -589,6 +675,10 @@ class RsyncFromGSTaskBlock(TaskBlock):
         contents: bool | None = None,
         check_exists: bool = False,
         no_fail: bool = False,
+        exclude: str | Sequence[str] | None = None,
+        dry_run: bool = False,
+        verbose: bool = True,
+        exclusive: bool = False,
     ) -> None:
         self.gs_path = gs_path  # Should be gs://bucket/path format
         self.path = path  # Local destination path
@@ -598,12 +688,22 @@ class RsyncFromGSTaskBlock(TaskBlock):
         self.contents = contents  # If True, add trailing slashes; if False, remove them; if None, leave as-is
         self.check_exists = check_exists  # If True, only rsync if remote path exists
         self.no_fail = no_fail
+        self.exclude = exclude  # Regex (or list of regexes) passed to gsutil rsync -x
+        self.dry_run = dry_run  # If True, run gsutil rsync in dry-run mode (-n)
+        self.verbose = verbose  # If False, pass top-level -q to gsutil (errors only)
+        # If True, hold the shared global GCS-download lock so at most one
+        # exclusive rsync runs concurrently on this host.
+        self.exclusive = exclusive
 
     def execute(self) -> str:
         """Generate a locked gsutil rsync command."""
-        # Create a lockfile based on the local path to prevent concurrent access
-        path_hash = hashlib.sha256(self.path.encode("utf-8")).hexdigest()[:10]
-        lockfile = f"/tmp/{path_hash}.lock"
+        # When exclusive, take the shared global lock so only one GCS download
+        # runs at a time host-wide; otherwise use a per-path lock.
+        if self.exclusive:
+            lockfile = _GCS_DOWNLOAD_GLOBAL_LOCKFILE
+        else:
+            path_hash = hashlib.sha256(self.path.encode("utf-8")).hexdigest()[:10]
+            lockfile = f"/tmp/{path_hash}.lock"
 
         # Handle trailing slashes based on contents parameter
         source_path = self.gs_path
@@ -633,14 +733,23 @@ class RsyncFromGSTaskBlock(TaskBlock):
         inner_parts.append(f"mkdir -p -- {dquote(target_path)}")
 
         # Build the gsutil rsync command
-        # -r for recursive sync, -m for parallel operations
-        gsutil_cmd_parts = ["gsutil", "-m", "rsync", "-r"]
+        # -r for recursive sync, -m for parallel operations.
+        # Top-level -q suppresses per-file progress; omit it when verbose.
+        gsutil_cmd_parts = ["gsutil"]
+        if not self.verbose:
+            gsutil_cmd_parts.append("-q")
+        gsutil_cmd_parts.extend(["-m", "rsync", "-r"])
 
         # Add optional flags
         if self.delete:
             gsutil_cmd_parts.append("-d")  # Delete files in dest not in source
         if self.checksum:
             gsutil_cmd_parts.append("-c")  # Use checksum instead of mtime
+        if self.dry_run:
+            gsutil_cmd_parts.append("-n")  # Dry-run (no side effects)
+        exclude_pattern = _build_exclude_pattern(self.exclude)
+        if exclude_pattern is not None:
+            gsutil_cmd_parts.extend(["-x", dquote(exclude_pattern)])
 
         # Add source and destination (with potential trailing slashes)
         gsutil_cmd_parts.extend([dquote(source_path), dquote(dest_path)])
@@ -692,6 +801,13 @@ class SetEnvTaskBlock(TaskBlock):
         else:
             # Use dquote to allow variable expansion in the value
             return f"export {self.name}={dquote(self.value)}"
+
+
+def _is_raw_block(block: TaskBlock) -> bool:
+    """Return True if *block* should be emitted verbatim (no echo prefix)."""
+    # Avoid importing batch.py at module level (circular).  Check by class name
+    # so the test works even if the class hasn't been imported yet.
+    return type(block).__name__ == '_RawShellBlock'
 
 
 def _find_artifact_dependencies(value: Any) -> Iterable[Artifact]:
@@ -1204,27 +1320,52 @@ class Executor:
         dependents: Dict[int, Set[int]],
         num_dependencies: Dict[int, int],
     ) -> None:
-        """Scan artifact attributes to build the dependency graph."""
+        """Scan artifact attributes to build the dependency graph.
+
+        Uses ``artifact.get_direct_dependencies()`` so that subclasses like
+        ``ArtifactBatch`` can customise which artifacts count as dependencies
+        (e.g. excluding contained children).
+
+        When a dependency is not directly in the artifact set (e.g. because it
+        was absorbed into an ``ArtifactBatch`` by ``--autobatch``), we resolve
+        it to the containing batch so the edge is still recorded correctly.
+        """
+        # Build a reverse lookup: child artifact id → containing batch id.
+        # This enables dependency resolution after autobatching absorbs
+        # children into batches.
+        from .batch import ArtifactBatch
+        child_to_batch: Dict[int, int] = {}
+        for a in artifacts:
+            if isinstance(a, ArtifactBatch):
+                for child in a._batch_artifacts:
+                    child_to_batch[id(child)] = id(a)
+
         for artifact in artifacts:
             artifact_id = id(artifact)
-            
-            # Scan all attributes for artifact references
-            for attr_value in vars(artifact).values():
-                for dependency in _find_artifact_dependencies(attr_value):
-                    dependency_id = id(dependency)
-                    
-                    # Validate dependency is in the artifact set
-                    if dependency_id not in artifact_by_id:
+
+            for dependency in artifact.get_direct_dependencies():
+                dependency_id = id(dependency)
+
+                # If the dependency was absorbed into a batch, resolve to that batch
+                if dependency_id not in artifact_by_id:
+                    resolved_id = child_to_batch.get(dependency_id)
+                    if resolved_id is not None:
+                        dependency_id = resolved_id
+                    else:
                         raise ValueError(
                             f"Artifact {artifact} depends on {dependency}, "
                             "which is not in the artifact set. "
                             "All dependencies must be explicitly included."
                         )
-                    
-                    # Add edge: dependency -> artifact (artifact depends on dependency)
-                    if artifact_id not in dependents[dependency_id]:
-                        dependents[dependency_id].add(artifact_id)
-                        num_dependencies[artifact_id] += 1
+
+                # Skip self-dependencies (a batch depending on itself)
+                if dependency_id == artifact_id:
+                    continue
+
+                # Add edge: dependency -> artifact (artifact depends on dependency)
+                if artifact_id not in dependents[dependency_id]:
+                    dependents[dependency_id].add(artifact_id)
+                    num_dependencies[artifact_id] += 1
 
     def _kahn_layered_sort(
         self,
@@ -1370,6 +1511,7 @@ class SlurmExecutor(Executor):
         default_slurm_args: Dict[str, Any] | None = None,
         dry_run: bool = False,
         setup_command: str | None = None,
+        launch_dir: str | None = None,
     ) -> None:
         super().__init__()
         # Initialize project context if provided
@@ -1386,8 +1528,11 @@ class SlurmExecutor(Executor):
             artifact_path = proj_conf.get("artifact_path") or str(mgr.get_project_dir(proj_name) / "artifacts")
         if code_path is None:
             code_path = proj_conf.get("code_path") or str(Path.cwd())
+        if launch_dir is None:
+            launch_dir = proj_conf.get("launch_dir")
         self.artifact_path = Path(artifact_path)
         self.code_path = Path(code_path)
+        self.launch_dir: str | None = launch_dir
         self.project = Project.name or project
         self.gs_path = gs_path
         self.default_slurm_args = default_slurm_args or {}
@@ -1413,11 +1558,13 @@ class SlurmExecutor(Executor):
 
     def compile_artifact(self, artifact: Artifact) -> Task:
         """Compile an artifact into a task by calling its construct method."""
+        log_dir = self._global_config.get('log_directory', str(Path.home() / ".experiments" / "logs"))
         task = Task(
             artifact_path=str(self.artifact_path),
             code_path=str(self.code_path),
             artifact=artifact,
             gs_path=self.gs_path,
+            log_dir=log_dir,
         )
         artifact.construct(task)
         return task
@@ -2222,10 +2369,18 @@ class SlurmExecutor(Executor):
                     for block in task.blocks:
                         command = block.execute()
                         if command:
-                            # Print the command before executing it (escape for double quotes)
-                            escaped_command = command.replace('\\', '\\\\').replace('"', '\\"').replace('`', '\\`')
-                            lines.append(f'    echo "+ {escaped_command}" >&2')
-                            lines.append(f"    {command}")
+                            if _is_raw_block(block):
+                                # Raw shell blocks are emitted verbatim (no echo prefix)
+                                lines.append(f"    {command}")
+                            else:
+                                # Print the command before executing it (escape for double quotes).
+                                # $ must be escaped too so that $(...) in the traced command
+                                # isn't evaluated during the echo — inside $(...) bash does
+                                # not honor \" escapes, which breaks commands like
+                                # `export X=$(python3 -c "...('',0)...")`.
+                                escaped_command = command.replace('\\', '\\\\').replace('"', '\\"').replace('`', '\\`').replace('$', '\\$')
+                                lines.append(f'    echo "+ {escaped_command}" >&2')
+                                lines.append(f"    {command}")
                 lines.append("    ;;")
         else:
             # Original behavior: one case per task
@@ -2238,10 +2393,17 @@ class SlurmExecutor(Executor):
                 for block in task.blocks:
                     command = block.execute()
                     if command:
-                        # Print the command before executing it (escape for double quotes)
-                        escaped_command = command.replace('\\', '\\\\').replace('"', '\\"').replace('`', '\\`')
-                        lines.append(f'    echo "+ {escaped_command}" >&2')
-                        lines.append(f"    {command}")
+                        if _is_raw_block(block):
+                            lines.append(f"    {command}")
+                        else:
+                            # Print the command before executing it (escape for double quotes).
+                            # $ must be escaped too so that $(...) in the traced command
+                            # isn't evaluated during the echo — inside $(...) bash does
+                            # not honor \" escapes, which breaks commands like
+                            # `export X=$(python3 -c "...('',0)...")`.
+                            escaped_command = command.replace('\\', '\\\\').replace('"', '\\"').replace('`', '\\`').replace('$', '\\$')
+                            lines.append(f'    echo "+ {escaped_command}" >&2')
+                            lines.append(f"    {command}")
                 lines.append("    ;;")
         
         # Add error handler for invalid IDs
@@ -2262,17 +2424,63 @@ class SlurmExecutor(Executor):
         header: List[str],
         body: List[str],
     ) -> str:
-        """Write the complete script to a temporary file and return the path."""
-        with tempfile.NamedTemporaryFile(
-            mode='w',
-            prefix=f"slurm_tier_{tier_index}_grp{group_index}_",
-            suffix='.sh',
-            delete=False,
-        ) as f:
-            f.write("\n".join(header))
-            f.write("\n\n")
-            f.write("\n".join(body))
-            return f.name
+        """Write the script and return the path to submit via sbatch.
+
+        When ``launch_dir`` is set (via constructor or
+        ``Project.config.launch_dir``), the real script (header + body) is
+        written to that shared-filesystem directory.  sbatch then receives a
+        tiny wrapper in ``/tmp`` that just calls the real script — this keeps
+        the submission node happy while ensuring compute nodes can read the
+        payload from the shared path.
+
+        Without ``launch_dir``, behaviour is unchanged: the full script goes
+        to a temp file and is passed directly to sbatch.
+        """
+        full_script = "\n".join(header) + "\n\n" + "\n".join(body)
+
+        if self.launch_dir is not None:
+            # Write the real script to the shared launch directory.
+            launch_path = Path(self.launch_dir)
+            launch_path.mkdir(parents=True, exist_ok=True)
+
+            with tempfile.NamedTemporaryFile(
+                mode='w',
+                prefix=f"slurm_tier_{tier_index}_grp{group_index}_",
+                suffix='.sh',
+                delete=False,
+                dir=str(launch_path),
+            ) as real:
+                real.write(full_script)
+                real_path = real.name
+
+            # Make the real script executable
+            os.chmod(real_path, 0o755)
+
+            # Build a thin wrapper for sbatch: same #SBATCH header so Slurm
+            # parses resources correctly, then exec the real script (inherits
+            # all environment variables).
+            wrapper_lines = [line for line in header]
+            wrapper_lines.append("")
+            wrapper_lines.append(f"exec bash {shquote(real_path)}")
+
+            with tempfile.NamedTemporaryFile(
+                mode='w',
+                prefix=f"wrapper_tier_{tier_index}_grp{group_index}_",
+                suffix='.sh',
+                delete=False,
+            ) as wrapper:
+                wrapper.write("\n".join(wrapper_lines))
+                return wrapper.name
+        else:
+            # No launch_dir — write full script to /tmp as before.
+            with tempfile.NamedTemporaryFile(
+                mode='w',
+                prefix=f"slurm_tier_{tier_index}_grp{group_index}_",
+                suffix='.sh',
+                delete=False,
+            ) as f:
+                f.write(full_script)
+                return f.name
 
     def _submit_sbatch_script(self, script_path: str) -> str:
         """Submit a script via sbatch and return the job ID.

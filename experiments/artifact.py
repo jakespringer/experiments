@@ -36,18 +36,30 @@ class Artifact:
     
     def should_skip(self) -> bool:
         """Determine if this artifact should be skipped during execution.
-        
+
         This method provides a centralized place to check various skip conditions.
         Currently checks if the artifact exists, but can be extended in the future
         with additional skip conditions.
-        
+
         Override this method in subclasses for custom skip logic, or simply
         override the 'exists' property for existence-based skipping.
-        
+
         Returns:
             True if the artifact should be skipped, False otherwise
         """
         return self.exists
+
+    def get_direct_dependencies(self) -> List["Artifact"]:
+        """Return artifacts that this artifact directly depends on.
+
+        Default implementation scans all attribute values recursively.
+        Override in subclasses (e.g., ArtifactBatch) for custom behavior.
+        """
+        from .executor import _find_artifact_dependencies
+        deps: List[Artifact] = []
+        for attr_value in vars(self).values():
+            deps.extend(_find_artifact_dependencies(attr_value))
+        return deps
 
     def as_dict(self) -> Dict[str, Any]:
         # Shallow extraction to preserve Artifact references

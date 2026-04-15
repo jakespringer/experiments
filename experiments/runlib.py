@@ -588,45 +588,61 @@ def download_from_gs(
         client = _get_storage_client()
         bucket_name, key, contents_only = _parse_remote_contents_spec(remote_path)
         bucket = client.bucket(bucket_name)
-        
+
         retry_obj = _build_gcs_retry(retry)
-        
+
         # Determine if remote is a directory
         is_dir = _directory_flag_for_remote(bucket, key, directory)
-        
+
+        # Stage the download at a sibling `.part-download` path and atomically
+        # rename on success, so a failed/interrupted download never leaves a
+        # partial file or empty directory at local_path.
+        final_local = Path(local_path)
+        tmp_local = final_local.parent / (final_local.name + ".part-download")
+
         if not is_dir:
             # Single file download
-            local_file = Path(local_path)
-            _ensure_dir(local_file.parent)
-            
-            blob = bucket.blob(key)
-            blob.download_to_filename(str(local_file), retry=retry_obj)
+            _ensure_dir(final_local.parent)
+            try:
+                tmp_local.unlink()
+            except FileNotFoundError:
+                pass
+            try:
+                blob = bucket.blob(key)
+                blob.download_to_filename(str(tmp_local), retry=retry_obj)
+                os.replace(str(tmp_local), str(final_local))
+            except BaseException:
+                try:
+                    tmp_local.unlink()
+                except (FileNotFoundError, OSError):
+                    pass
+                raise
+            return
+
+        # Directory download
+        prefix = key if key.endswith("/") else key + "/"
+        if key and not key.endswith("/") and not contents_only:
+            prefix = key + "/"
+
+        blobs = _list_remote_tree(client, bucket, prefix, retry_obj)
+
+        if not blobs:
+            return
+
+        # Leaf-nesting preserves the original on-disk layout (local_path/leaf/...)
+        if not ensure_contents and not contents_only:
+            leaf = key.rstrip("/").split("/")[-1] if key else ""
         else:
-            # Directory download
-            prefix = key if key.endswith("/") else key + "/"
-            if key and not key.endswith("/") and not contents_only:
-                prefix = key + "/"
-            
-            blobs = _list_remote_tree(client, bucket, prefix, retry_obj)
-            
-            if not blobs:
-                return
-            
-            # Determine destination root
-            local_root = Path(local_path)
-            
-            if not ensure_contents and not contents_only:
-                # Nest under remote leaf name
-                leaf = key.rstrip("/").split("/")[-1] if key else ""
-                if leaf:
-                    local_root = local_root / leaf
-            
+            leaf = ""
+
+        if final_local.exists():
+            # Pre-existing destination: keep the original in-place overlay
+            # semantics (merge downloaded files into what's already there).
+            # The "don't leave an empty dir behind on failure" guarantee only
+            # applies to fresh downloads.
+            local_root = final_local / leaf if leaf else final_local
             _ensure_dir(local_root)
-            
-            # Prepare blobs and destination paths for download
-            # Use transfer_manager.download_many for concurrent downloads
             blob_file_pairs = []
-            
             for blob_name in blobs:
                 relative = blob_name[len(prefix):] if blob_name.startswith(prefix) else blob_name
                 if relative:
@@ -634,20 +650,49 @@ def download_from_gs(
                     _ensure_dir(local_file.parent)
                     blob = bucket.blob(blob_name)
                     blob_file_pairs.append((blob, str(local_file)))
-            
             if not blob_file_pairs:
                 return
-            
-            # Use transfer manager for concurrent downloads
             results = _transfer_manager_module.download_many(
                 blob_file_pairs,
                 max_workers=max_workers
             )
-            
-            # Check for errors
             for (blob, dest_path), result in zip(blob_file_pairs, results):
                 if isinstance(result, Exception):
                     raise result
+            return
+
+        # Fresh download: stage into tmp_local, rename into place on success,
+        # scrub on any failure.
+        shutil.rmtree(tmp_local, ignore_errors=True)
+        staging_root = tmp_local / leaf if leaf else tmp_local
+        try:
+            _ensure_dir(staging_root)
+
+            blob_file_pairs = []
+            for blob_name in blobs:
+                relative = blob_name[len(prefix):] if blob_name.startswith(prefix) else blob_name
+                if relative:
+                    local_file = staging_root / relative
+                    _ensure_dir(local_file.parent)
+                    blob = bucket.blob(blob_name)
+                    blob_file_pairs.append((blob, str(local_file)))
+
+            if not blob_file_pairs:
+                shutil.rmtree(tmp_local, ignore_errors=True)
+                return
+
+            results = _transfer_manager_module.download_many(
+                blob_file_pairs,
+                max_workers=max_workers
+            )
+            for (blob, dest_path), result in zip(blob_file_pairs, results):
+                if isinstance(result, Exception):
+                    raise result
+
+            os.rename(str(tmp_local), str(final_local))
+        except BaseException:
+            shutil.rmtree(tmp_local, ignore_errors=True)
+            raise
     
     _with_retries(_download, retry)
 

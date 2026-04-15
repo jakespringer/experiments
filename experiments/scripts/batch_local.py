@@ -8,6 +8,7 @@ a live-updating dashboard showing progress, timing, and job status.
 
 import argparse
 import os
+import re
 import sys
 import threading
 import queue
@@ -34,6 +35,9 @@ from rich.style import Style
 from rich.align import Align
 from rich import box
 
+# Strip ANSI escapes from subprocess output so they don't corrupt Rich rendering
+_ANSI_ESCAPE = re.compile(r'\x1b\[[0-9;?]*[A-Za-z]|\x1b[()][AB012]|\x1b\][^\x07]*\x07|\r')
+
 # Dark color scheme - black and dark grays only
 COLORS = {
     "bg": "black",
@@ -47,12 +51,16 @@ COLORS = {
     "error": "red3",
     "warning": "orange4",
     "running": "dodger_blue2",
+    "yielding": "dark_goldenrod",
+    "selected_bg": "light_sky_blue1",
+    "selected_fg": "black",
 }
 
 
 class JobStatus(Enum):
     PENDING = "pending"
     RUNNING = "running"
+    YIELDING = "yielding"
     COMPLETED = "completed"
     ERRORED = "errored"
 
@@ -90,7 +98,6 @@ class Job:
         else:
             return f"{seconds}s"
 
-    @property
     def short_command(self, max_len: int = 50) -> str:
         if len(self.command) <= max_len:
             return self.command
@@ -106,6 +113,7 @@ class JobManager:
     current_output_job: Optional[int] = None
     output_lines: deque = field(default_factory=lambda: deque(maxlen=500))
     output_lock: threading.Lock = field(default_factory=threading.Lock)
+    scroll_offset: int = 0  # 0 = follow tail, >0 = scrolled up N lines from bottom
 
     def add_job(self, index: int, command: str):
         with self.lock:
@@ -134,6 +142,15 @@ class JobManager:
             if self.current_output_job is None:
                 self.current_output_job = index
                 self.output_lines.clear()
+                self.scroll_offset = 0
+
+    def yield_job(self, index: int):
+        """Mark a job as yielding — GPU work done, finalizing."""
+        with self.lock:
+            for job in self.jobs:
+                if job.index == index:
+                    job.status = JobStatus.YIELDING
+                    break
 
     def complete_job(self, index: int, exit_code: int):
         # Update job state under self.lock, and compute "next" while still under self.lock.
@@ -149,8 +166,8 @@ class JobManager:
                         self.completed_durations.append(job.duration.total_seconds())
                     break
     
-            # Pick a deterministic next running job (by worker_id then index)
-            running = [j for j in self.jobs if j.status == JobStatus.RUNNING]
+            # Pick a deterministic next active job (by worker_id then index)
+            running = [j for j in self.jobs if j.status in (JobStatus.RUNNING, JobStatus.YIELDING)]
             running.sort(key=lambda j: (j.worker_id is None, j.worker_id or 0, j.index))
             next_running_index = running[0].index if running else None
     
@@ -159,21 +176,39 @@ class JobManager:
             if self.current_output_job == index:
                 self.current_output_job = next_running_index
                 self.output_lines.clear()
+                self.scroll_offset = 0
 
     def append_output(self, job_index: int, line: str):
         with self.output_lock:
             if self.current_output_job == job_index:
                 self.output_lines.append(line)
+                # Keep scroll position stable when scrolled up
+                if self.scroll_offset > 0:
+                    self.scroll_offset += 1
+
+    def scroll_output(self, delta: int, page_size: int = 1):
+        """Scroll output view. Positive delta = scroll up (back), negative = scroll down (forward)."""
+        with self.output_lock:
+            total = len(self.output_lines)
+            new_offset = self.scroll_offset + delta
+            self.scroll_offset = max(0, min(new_offset, max(0, total - page_size)))
 
     def get_output_lines(self, max_lines: int = 50) -> tuple[Optional[int], list[str]]:
         with self.output_lock:
-            return self.current_output_job, list(self.output_lines)[-max_lines:]
+            all_lines = list(self.output_lines)
+            total = len(all_lines)
+            if self.scroll_offset == 0 or self.scroll_offset >= total:
+                return self.current_output_job, all_lines[-max_lines:]
+            end = total - self.scroll_offset
+            start = max(0, end - max_lines)
+            return self.current_output_job, all_lines[start:end]
 
     def switch_to_job(self, job_index: int, output_dir: str):
         """Switch to monitoring a specific job, loading its output from file."""
         with self.output_lock:
             self.current_output_job = job_index
             self.output_lines.clear()
+            self.scroll_offset = 0
             # Load existing output from file
             output_file = os.path.join(output_dir, f"{job_index}.txt")
             if os.path.exists(output_file):
@@ -184,54 +219,20 @@ class JobManager:
                 except Exception:
                     pass
 
-    def cycle_job(self, direction: int, output_dir: str):
-        """Cycle through running jobs. direction: 1 for next, -1 for previous."""
-        running = self.running_jobs
-        if not running:
-            return
-        
-        with self.output_lock:
-            current = self.current_output_job
-            # Get list of running job indices
-            running_indices = [j.index for j in sorted(running, key=lambda j: j.worker_id or 0)]
-            
-            if current is None or current not in running_indices:
-                # Select first running job
-                new_index = running_indices[0]
-            else:
-                # Find current position and cycle
-                try:
-                    pos = running_indices.index(current)
-                    new_pos = (pos + direction) % len(running_indices)
-                    new_index = running_indices[new_pos]
-                except ValueError:
-                    new_index = running_indices[0]
-            
-            if new_index != current:
-                self.current_output_job = new_index
-                self.output_lines.clear()
-                # Load existing output from file
-                output_file = os.path.join(output_dir, f"{new_index}.txt")
-                if os.path.exists(output_file):
-                    try:
-                        with open(output_file, "r") as f:
-                            for line in f:
-                                self.output_lines.append(line.rstrip('\n'))
-                    except Exception:
-                        pass
-
     @property
     def stats(self) -> dict:
         with self.lock:
             total = len(self.jobs)
             pending = sum(1 for j in self.jobs if j.status == JobStatus.PENDING)
             running = sum(1 for j in self.jobs if j.status == JobStatus.RUNNING)
+            yielding = sum(1 for j in self.jobs if j.status == JobStatus.YIELDING)
             completed = sum(1 for j in self.jobs if j.status == JobStatus.COMPLETED)
             errored = sum(1 for j in self.jobs if j.status == JobStatus.ERRORED)
             return {
                 "total": total,
                 "pending": pending,
                 "running": running,
+                "yielding": yielding,
                 "completed": completed,
                 "errored": errored,
                 "finished": completed + errored,
@@ -240,7 +241,7 @@ class JobManager:
     @property
     def running_jobs(self) -> list[Job]:
         with self.lock:
-            return [j for j in self.jobs if j.status == JobStatus.RUNNING]
+            return [j for j in self.jobs if j.status in (JobStatus.RUNNING, JobStatus.YIELDING)]
 
     @property
     def finished_jobs(self) -> list[Job]:
@@ -291,26 +292,57 @@ class Dashboard:
         self.output_path = output_path
         self.num_parallel = num_parallel
         self.console = console
-        self.layout = Layout()
-        self._setup_layout()
+        self.running_scroll_top = 0
+        self.completed_scroll_top = 0
 
-    def _setup_layout(self):
-        self.layout.split_row(
-            Layout(name="left", ratio=1),
-            Layout(name="right", ratio=1),
+    def _running_panel_size(self) -> int:
+        """Dynamic size for the running panel based on num_parallel."""
+        needed = self.num_parallel + 3  # 2 borders + 1 header + num_parallel rows
+        max_size = max((self.console.size.height - 13) // 2, 5)
+        return max(4, min(needed, max_size))
+
+    def _visible_rows(self, panel: str) -> int:
+        """Number of job rows visible in a panel (excluding borders and header)."""
+        if panel == "running":
+            return self._running_panel_size() - 3
+        else:
+            used = 13 + self._running_panel_size()
+            remaining = self.console.size.height - used
+            return max(remaining - 3, 1)
+
+    def navigate_job(self, direction: int):
+        """Cycle through jobs: running first, then finished. direction: -1 for up, 1 for down."""
+        running = self._get_sorted_running()
+        finished = self._get_sorted_finished()
+        navigable = [j.index for j in running] + [j.index for j in finished]
+        if not navigable:
+            return
+
+        current = self.manager.current_output_job
+        if current is None or current not in navigable:
+            new_index = navigable[0]
+        else:
+            pos = navigable.index(current)
+            new_pos = max(0, min(pos + direction, len(navigable) - 1))
+            new_index = navigable[new_pos]
+
+        if new_index != current:
+            self.manager.switch_to_job(new_index, self.output_path)
+
+    def _get_sorted_running(self) -> list[Job]:
+        return sorted(
+            self.manager.running_jobs,
+            key=lambda j: (j.status == JobStatus.YIELDING, j.worker_id or 0),
         )
-        self.layout["left"].split_column(
-            Layout(name="header", size=3),
-            Layout(name="progress", size=10),
-            Layout(name="running", ratio=1),
-            Layout(name="completed", ratio=1),
-        )
+
+    def _get_sorted_finished(self) -> list[Job]:
+        return self.manager.finished_jobs
 
     def get_output_panel_height(self) -> int:
         """Calculate how many lines fit in the output panel."""
-        # Get terminal height, subtract 2 for panel borders, 1 for title, 2 for padding
+        # Panel borders (2) + safety margin (1) to prevent Rich from cropping bottom lines
         terminal_height = self.console.size.height
-        return max(terminal_height - 5, 10)
+        return max(terminal_height - 3, 5)
 
     def format_timedelta(self, td: Optional[timedelta]) -> str:
         if td is None:
@@ -329,6 +361,11 @@ class Dashboard:
         text.append("  |  ", style=COLORS["text_dim"])
         text.append(f"{self.num_parallel}", style=COLORS["accent"])
         text.append(" workers", style=COLORS["text_dim"])
+        text.append("  |  ", style=COLORS["text_dim"])
+        text.append("↑↓", style=COLORS["accent"])
+        text.append(" select job  ", style=COLORS["text_dim"])
+        text.append("PgUp/Dn", style=COLORS["accent"])
+        text.append(" scroll output", style=COLORS["text_dim"])
         return Panel(
             Align.center(text),
             box=box.HEAVY,
@@ -357,6 +394,8 @@ class Dashboard:
         text.append(f"     Estimate  {estimated:>10}\n", style=COLORS["text_dim"])
         text.append(f" Running   {stats['running']:>5}", style=COLORS["running"])
         text.append(f"     Output    {self.output_path}\n", style=COLORS["text_dim"])
+        text.append(f" Yielding  {stats['yielding']:>5}", style=COLORS["yielding"] if stats["yielding"] > 0 else COLORS["text_dim"])
+        text.append(f"\n", style=COLORS["text_dim"])
         text.append(f" Done      {stats['completed']:>5}", style=COLORS["success"])
         text.append(f"\n", style=COLORS["text_dim"])
         text.append(f" Failed    {stats['errored']:>5}", style=COLORS["error"] if stats["errored"] > 0 else COLORS["text_dim"])
@@ -384,35 +423,65 @@ class Dashboard:
         table.add_column("TIME", style=COLORS["running"], width=9, justify="right")
         table.add_column("CMD", style=COLORS["text_dim"], no_wrap=True)
 
-        running_jobs = self.manager.running_jobs
-        for job in sorted(running_jobs, key=lambda j: j.worker_id or 0):
+        all_running = self._get_sorted_running()
+        visible_rows = self._visible_rows("running")
+
+        # Scroll-into-view: ensure selected job is visible
+        selected_pos = None
+        for i, job in enumerate(all_running):
+            if job.index == self.manager.current_output_job:
+                selected_pos = i
+                break
+        if selected_pos is not None:
+            if selected_pos < self.running_scroll_top:
+                self.running_scroll_top = selected_pos
+            elif selected_pos >= self.running_scroll_top + visible_rows:
+                self.running_scroll_top = selected_pos - visible_rows + 1
+        max_top = max(0, len(all_running) - visible_rows)
+        self.running_scroll_top = max(0, min(self.running_scroll_top, max_top))
+
+        visible_jobs = all_running[self.running_scroll_top:self.running_scroll_top + visible_rows]
+        for job in visible_jobs:
             is_selected = job.index == self.manager.current_output_job
+            time_color = COLORS["yielding"] if job.status == JobStatus.YIELDING else COLORS["running"]
+            bg = COLORS["selected_bg"] if is_selected else ""
             if is_selected:
-                marker = Text(">", style=f"bold {COLORS['text_bright']}")
-                job_text = Text(str(job.index), style=f"bold {COLORS['text_bright']}")
-                time_text = Text(job.duration_str, style=f"bold {COLORS['running']}")
-                cmd_text = Text(job.short_command, style=COLORS["text"])
+                sel = f"bold on {bg}"
+                marker = Text("▶", style=f"{COLORS['accent']} on {bg}")
+                job_text = Text(str(job.index), style=f"bold {COLORS['selected_fg']} on {bg}")
+                worker_text = Text(str(job.worker_id), style=f"{COLORS['selected_fg']} on {bg}")
+                gpu_text = Text(job.gpus, style=f"{COLORS['selected_fg']} on {bg}")
+                time_text = Text(job.duration_str, style=f"bold {time_color} on {bg}")
+                cmd_text = Text(job.short_command(), style=f"{COLORS['selected_fg']} on {bg}")
             else:
                 marker = Text(" ")
                 job_text = Text(str(job.index), style=COLORS["text"])
-                time_text = Text(job.duration_str, style=COLORS["running"])
-                cmd_text = Text(job.short_command, style=COLORS["text_dim"])
-            
+                worker_text = Text(str(job.worker_id), style=COLORS["text_dim"])
+                gpu_text = Text(job.gpus, style=COLORS["text_dim"])
+                time_text = Text(job.duration_str, style=time_color)
+                cmd_text = Text(job.short_command(), style=COLORS["text_dim"])
+
             table.add_row(
                 marker,
                 job_text,
-                str(job.worker_id),
-                job.gpus,
+                worker_text,
+                gpu_text,
                 time_text,
                 cmd_text,
             )
 
-        title = f"[{COLORS['text_dim']}]running (up/down to switch)[/]"
+        scroll_info = ""
+        if len(all_running) > visible_rows:
+            top = self.running_scroll_top + 1
+            bot = min(self.running_scroll_top + visible_rows, len(all_running))
+            scroll_info = f" {top}-{bot}/{len(all_running)}"
+        border_style = COLORS["border"]
+        title = f"[{COLORS['text_dim']}]running{scroll_info}[/]"
         return Panel(
             table,
             title=title,
             box=box.ROUNDED,
-            border_style=COLORS["running"],
+            border_style=border_style,
             padding=(0, 0),
         )
 
@@ -424,35 +493,75 @@ class Dashboard:
             expand=True,
             padding=(0, 1),
         )
+        table.add_column("", width=1)  # Selection marker
         table.add_column("JOB", style=COLORS["text"], width=5, justify="right")
         table.add_column("STATUS", width=6, justify="center")
         table.add_column("EXIT", width=4, justify="right")
         table.add_column("TIME", style=COLORS["text_dim"], width=9, justify="right")
         table.add_column("CMD", style=COLORS["text_dim"], no_wrap=True)
 
-        finished_jobs = self.manager.finished_jobs[:15]
-        for job in finished_jobs:
+        all_finished = self._get_sorted_finished()
+        visible_rows = self._visible_rows("completed")
+
+        # Scroll-into-view: ensure selected job is visible
+        selected_pos = None
+        for i, job in enumerate(all_finished):
+            if job.index == self.manager.current_output_job:
+                selected_pos = i
+                break
+        if selected_pos is not None:
+            if selected_pos < self.completed_scroll_top:
+                self.completed_scroll_top = selected_pos
+            elif selected_pos >= self.completed_scroll_top + visible_rows:
+                self.completed_scroll_top = selected_pos - visible_rows + 1
+        max_top = max(0, len(all_finished) - visible_rows)
+        self.completed_scroll_top = max(0, min(self.completed_scroll_top, max_top))
+
+        visible_jobs = all_finished[self.completed_scroll_top:self.completed_scroll_top + visible_rows]
+        for job in visible_jobs:
+            is_selected = job.index == self.manager.current_output_job
+            bg = COLORS["selected_bg"] if is_selected else ""
             if job.status == JobStatus.COMPLETED:
-                status = Text("OK", style=COLORS["success"])
-                exit_style = COLORS["success"]
+                status_label, status_color = "OK", COLORS["success"]
             else:
-                status = Text("FAIL", style=COLORS["error"])
-                exit_style = COLORS["error"]
+                status_label, status_color = "FAIL", COLORS["error"]
+
+            if is_selected:
+                marker = Text("▶", style=f"{COLORS['accent']} on {bg}")
+                job_text = Text(str(job.index), style=f"bold {COLORS['selected_fg']} on {bg}")
+                status = Text(status_label, style=f"bold {status_color} on {bg}")
+                exit_text = Text(str(job.exit_code), style=f"{status_color} on {bg}")
+                time_text = Text(job.duration_str, style=f"{COLORS['selected_fg']} on {bg}")
+                cmd_text = Text(job.short_command(), style=f"{COLORS['selected_fg']} on {bg}")
+            else:
+                marker = Text(" ")
+                job_text = Text(str(job.index))
+                status = Text(status_label, style=status_color)
+                exit_text = Text(str(job.exit_code), style=status_color)
+                time_text = Text(job.duration_str, style=COLORS["text_dim"])
+                cmd_text = Text(job.short_command(), style=COLORS["text_dim"])
 
             table.add_row(
-                str(job.index),
+                marker,
+                job_text,
                 status,
-                Text(str(job.exit_code or 0), style=exit_style),
-                job.duration_str,
-                job.short_command,
+                exit_text,
+                time_text,
+                cmd_text,
             )
 
         stats = self.manager.stats
+        scroll_info = ""
+        if len(all_finished) > visible_rows:
+            top = self.completed_scroll_top + 1
+            bot = min(self.completed_scroll_top + visible_rows, len(all_finished))
+            scroll_info = f" {top}-{bot}/{len(all_finished)}"
+        border_style = COLORS["border"]
         return Panel(
             table,
-            title=f"[{COLORS['text_dim']}]completed {stats['finished']}/{stats['total']}[/]",
+            title=f"[{COLORS['text_dim']}]completed {stats['finished']}/{stats['total']}{scroll_info}[/]",
             box=box.ROUNDED,
-            border_style=COLORS["border"],
+            border_style=border_style,
             padding=(0, 0),
         )
 
@@ -467,34 +576,59 @@ class Dashboard:
         else:
             job = self.manager.get_job(job_index)
             cmd_short = job.command[:60] + "..." if job and len(job.command) > 60 else (job.command if job else "")
-            title = f"[{COLORS['text_dim']}]job {job_index}[/] [{COLORS['text_dim']}]{cmd_short}[/]"
-            
+            from rich.markup import escape as _markup_escape
+            if job and job.status == JobStatus.COMPLETED:
+                status_tag = f"[{COLORS['success']}]OK[/]"
+            elif job and job.status == JobStatus.ERRORED:
+                status_tag = f"[{COLORS['error']}]FAIL[/]"
+            elif job and job.status == JobStatus.YIELDING:
+                status_tag = f"[{COLORS['yielding']}]yielding[/]"
+            else:
+                status_tag = f"[{COLORS['running']}]running[/]"
+            scroll_tag = "" if self.manager.scroll_offset == 0 else f" [{COLORS['warning']}]SCROLLED[/]"
+            title = f"[{COLORS['text_dim']}]job {job_index}[/] {status_tag}{scroll_tag} [{COLORS['text_dim']}]{_markup_escape(cmd_short)}[/]"
+
             if not lines:
                 content = Text("Waiting for output...", style=COLORS["text_dim"])
             else:
                 content = Text()
                 # Only show the last N lines that fit (auto-scroll effect)
-                for line in lines:
-                    # Truncate long lines to panel width
-                    panel_width = (self.console.size.width // 2) - 4  # Half screen minus borders/padding
-                    display_line = line[:panel_width] if len(line) > panel_width else line
-                    content.append(display_line + "\n", style=COLORS["text"])
+                # Output panel gets 3/5 of the screen width
+                panel_width = (self.console.size.width * 3 // 5) - 4  # minus borders/padding
+                for i, line in enumerate(lines):
+                    clean = _ANSI_ESCAPE.sub('', line)
+                    display_line = clean[:panel_width] if len(clean) > panel_width else clean
+                    content.append(display_line, style=COLORS["text"])
+                    if i < len(lines) - 1:
+                        content.append("\n")
 
+        border_style = COLORS["border"]
         return Panel(
             content,
             title=title,
             box=box.ROUNDED,
-            border_style=COLORS["border_active"],
+            border_style=border_style,
             padding=(0, 1),
         )
 
     def generate(self) -> Layout:
-        self.layout["header"].update(self.create_header())
-        self.layout["progress"].update(self.create_progress_panel())
-        self.layout["running"].update(self.create_running_table())
-        self.layout["completed"].update(self.create_finished_table())
-        self.layout["right"].update(self.create_output_panel())
-        return self.layout
+        layout = Layout()
+        layout.split_row(
+            Layout(name="left", ratio=2),
+            Layout(name="right", ratio=3),
+        )
+        layout["left"].split_column(
+            Layout(name="header", size=3),
+            Layout(name="progress", size=10),
+            Layout(name="running", size=self._running_panel_size()),
+            Layout(name="completed", ratio=1),
+        )
+        layout["header"].update(self.create_header())
+        layout["progress"].update(self.create_progress_panel())
+        layout["running"].update(self.create_running_table())
+        layout["completed"].update(self.create_finished_table())
+        layout["right"].update(self.create_output_panel())
+        return layout
 
 
 def parse_arguments():
@@ -545,6 +679,62 @@ def read_commands():
     return commands
 
 
+def _monitor_yielded_process(
+    process: subprocess.Popen,
+    job_index: int,
+    output_file,
+    output_buffer: str,
+    manager: JobManager,
+):
+    """Background monitor for a process whose job has yielded GPU time."""
+    try:
+        while True:
+            ret = process.poll()
+            try:
+                ready, _, _ = select.select([process.stdout], [], [], 0.05)
+                if ready:
+                    chunk = process.stdout.read()
+                    if chunk:
+                        output_buffer += chunk
+                        while '\n' in output_buffer:
+                            line, output_buffer = output_buffer.split('\n', 1)
+                            output_file.write(line + '\n')
+                            output_file.flush()
+                            manager.append_output(job_index, line)
+            except (IOError, OSError):
+                pass
+
+            if ret is not None:
+                try:
+                    remaining = process.stdout.read()
+                    if remaining:
+                        output_buffer += remaining
+                except (IOError, OSError):
+                    pass
+                if output_buffer:
+                    for line in output_buffer.splitlines():
+                        output_file.write(line + '\n')
+                        output_file.flush()
+                        manager.append_output(job_index, line)
+
+                output_file.write(f"\n{'='*60}\n")
+                output_file.write(f"Finished: {datetime.now().isoformat()}\n")
+                output_file.write(f"Exit code: {ret}\n")
+                output_file.write(f"{'='*60}\n")
+                output_file.close()
+                manager.complete_job(job_index, ret)
+                return
+
+            time.sleep(0.01)
+    except Exception as e:
+        try:
+            output_file.write(f"\n\nBackground monitor error: {e}\n")
+            output_file.close()
+        except Exception:
+            pass
+        manager.complete_job(job_index, 1)
+
+
 def worker(
     worker_id: int,
     first_gpu: int,
@@ -552,6 +742,7 @@ def worker(
     job_queue: queue.Queue,
     output_dir: str,
     manager: JobManager,
+    bg_threads: list,
 ):
     """Worker thread that processes jobs from the queue."""
     if num_gpus > 0:
@@ -575,8 +766,15 @@ def worker(
         # Force unbuffered output for Python subprocesses
         env["PYTHONUNBUFFERED"] = "1"
 
+        # Yield file: child writes "true" to signal GPU work is done
+        yield_file = os.path.join(output_dir, f"yield_{index}.txt")
+        with open(yield_file, "w") as yf:
+            yf.write("false")
+        env["BATCH_LOCAL_YIELD_FILE"] = yield_file
+
         output_file = os.path.join(output_dir, f"{index}.txt")
         exit_code = 1
+        yielded = False
 
         with open(output_file, "w") as f:
             f.write(f"{'='*60}\n")
@@ -607,6 +805,7 @@ def worker(
                 
                 # Actively poll for process completion and output
                 output_buffer = ""
+                last_yield_check = time.time()
                 while True:
                     # Check if process has finished
                     ret = process.poll()
@@ -626,7 +825,28 @@ def worker(
                                     manager.append_output(index, line)
                     except (IOError, OSError):
                         pass  # No data available
-                    
+
+                    # Check yield file every ~1 second
+                    now = time.time()
+                    if now - last_yield_check >= 1.0:
+                        last_yield_check = now
+                        try:
+                            with open(yield_file, "r") as yf:
+                                if yf.read().strip().lower() == "true":
+                                    manager.yield_job(index)
+                                    dup_f = open(output_file, "a")
+                                    t = threading.Thread(
+                                        target=_monitor_yielded_process,
+                                        args=(process, index, dup_f, output_buffer, manager),
+                                        daemon=True,
+                                    )
+                                    t.start()
+                                    bg_threads.append(t)
+                                    yielded = True
+                                    break
+                        except Exception:
+                            pass
+
                     # If process has terminated, drain remaining output and exit
                     if ret is not None:
                         # Final read to drain any remaining output
@@ -656,12 +876,14 @@ def worker(
                 manager.append_output(index, error_msg)
                 exit_code = 1
 
-            f.write(f"\n{'='*60}\n")
-            f.write(f"Finished: {datetime.now().isoformat()}\n")
-            f.write(f"Exit code: {exit_code}\n")
-            f.write(f"{'='*60}\n")
+            if not yielded:
+                f.write(f"\n{'='*60}\n")
+                f.write(f"Finished: {datetime.now().isoformat()}\n")
+                f.write(f"Exit code: {exit_code}\n")
+                f.write(f"{'='*60}\n")
 
-        manager.complete_job(index, exit_code)
+        if not yielded:
+            manager.complete_job(index, exit_code)
         job_queue.task_done()
 
 
@@ -672,7 +894,8 @@ def create_output_directory(output_path: Optional[str]) -> str:
         if not os.path.exists(base_dir):
             raise RuntimeError(f"Must provide --output or create {base_dir}")
         existing = os.listdir(base_dir)
-        output_path = os.path.join(base_dir, str(len(existing) + 1))
+        next_id = max((int(d) for d in existing if d.isdigit()), default=0) + 1
+        output_path = os.path.join(base_dir, str(next_id))
 
     os.makedirs(output_path, exist_ok=True)
     return output_path
@@ -729,11 +952,12 @@ def main():
 
     dashboard = Dashboard(manager, output_path, num_parallel, console)
 
+    bg_threads = []
     threads = []
     for worker_id in range(num_parallel):
         t = threading.Thread(
             target=worker,
-            args=(worker_id, args.first_gpu, args.gpus, job_queue, output_path, manager),
+            args=(worker_id, args.first_gpu, args.gpus, job_queue, output_path, manager, bg_threads),
             daemon=True,
         )
         t.start()
@@ -757,43 +981,91 @@ def main():
         pass  # May fail if no controlling terminal
 
     def check_keyboard():
-        """Check for arrow key presses. Returns 'up', 'down', or None."""
+        """Check for key presses. Returns list of key names."""
         if not keyboard_enabled or tty_fd is None:
-            return None
+            return []
         try:
             ready, _, _ = select.select([tty_fd], [], [], 0)
-            if ready:
-                ch = os.read(tty_fd, 1).decode('utf-8', errors='ignore')
-                if ch == '\x1b':  # Escape sequence
-                    ch2 = os.read(tty_fd, 1).decode('utf-8', errors='ignore')
-                    if ch2 == '[':
-                        ch3 = os.read(tty_fd, 1).decode('utf-8', errors='ignore')
-                        if ch3 == 'A':
-                            return 'up'
-                        elif ch3 == 'B':
-                            return 'down'
+            if not ready:
+                return []
+            data = os.read(tty_fd, 256).decode('utf-8', errors='ignore')
+            keys = []
+            i = 0
+            while i < len(data):
+                if data[i] == '\x1b' and i + 1 < len(data) and data[i + 1] == '[':
+                    # CSI escape sequence: \x1b[ <params> <final_byte>
+                    i += 2
+                    param = ''
+                    while i < len(data) and (data[i].isdigit() or data[i] == ';'):
+                        param += data[i]
+                        i += 1
+                    if i < len(data):
+                        final = data[i]
+                        i += 1
+                        if final == 'A':
+                            keys.append('up')
+                        elif final == 'B':
+                            keys.append('down')
+                        elif final == 'C':
+                            keys.append('right')
+                        elif final == 'D':
+                            keys.append('left')
+                        elif final == 'Z':
+                            keys.append('shift_tab')
+                        elif final == '~':
+                            if param == '5':
+                                keys.append('page_up')
+                            elif param == '6':
+                                keys.append('page_down')
+                        elif final == 'H':
+                            keys.append('home')
+                        elif final == 'F':
+                            keys.append('end')
+                elif data[i] == '\t':
+                    keys.append('tab')
+                    i += 1
+                else:
+                    i += 1
+            return keys
         except Exception:
-            pass
-        return None
+            return []
 
     try:
         with Live(
             dashboard.generate(),
             console=console,
-            refresh_per_second=1 / args.refresh_rate,
+            auto_refresh=False,
             screen=True,
         ) as live:
-            while any(t.is_alive() for t in threads):
-                # Check for keyboard input
-                key = check_keyboard()
-                if key == 'up':
-                    manager.cycle_job(-1, output_path)
-                elif key == 'down':
-                    manager.cycle_job(1, output_path)
-                
-                live.update(dashboard.generate())
-                time.sleep(args.refresh_rate)
-            live.update(dashboard.generate())
+            last_render = time.monotonic()
+            render_interval = args.refresh_rate
+            while any(t.is_alive() for t in threads) or any(t.is_alive() for t in list(bg_threads)):
+                page_size = max(dashboard.get_output_panel_height() // 2, 5)
+                dirty = False
+                for key in check_keyboard():
+                    if key == 'up':
+                        dashboard.navigate_job(-1)
+                    elif key == 'down':
+                        dashboard.navigate_job(1)
+                    elif key == 'page_up':
+                        manager.scroll_output(page_size)
+                    elif key == 'page_down':
+                        manager.scroll_output(-page_size)
+                    elif key == 'home':
+                        manager.scroll_output(999999)
+                    elif key == 'end':
+                        manager.scroll_output(-999999)
+                    else:
+                        continue
+                    dirty = True
+
+                now = time.monotonic()
+                if dirty or now - last_render >= render_interval:
+                    live.update(dashboard.generate(), refresh=True)
+                    last_render = now
+
+                time.sleep(0.015)
+            live.update(dashboard.generate(), refresh=True)
             time.sleep(0.5)
 
     except KeyboardInterrupt:
@@ -810,6 +1082,8 @@ def main():
 
     for t in threads:
         t.join(timeout=1.0)
+    for t in bg_threads:
+        t.join(timeout=5.0)
 
     # Final summary
     stats = manager.stats

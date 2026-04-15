@@ -1,0 +1,3 @@
+[console_scripts]
+jobattach = experiments.scripts.jobattach:main
+jobcat = experiments.scripts.jobcat:main
