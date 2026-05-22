@@ -154,6 +154,41 @@ def combine_requirements(req_list: List[Dict[str, Any]]) -> Dict[str, Any]:
 # ArtifactBatch
 # ---------------------------------------------------------------------------
 
+def compute_member_dependencies(members: "Tuple[Artifact, ...] | List[Artifact]") -> List[Artifact]:
+    """Read-side deps of a batched-producer artifact.
+
+    Returns every ``Artifact`` reachable from each member's fields,
+    EXCLUDING the members themselves. Use this in custom
+    ``get_direct_dependencies`` overrides on batched-producer artifacts
+    (``ArtifactBatch``, ``BatchedJudgedResponses``,
+    ``BatchedModelResponses``, etc.) where:
+
+    * Surfacing the members as deps would mis-wire Slurm ``afterok``
+      edges when the batched stage runs without the per-member stage
+      registered (members not in the active artifact set → no edge).
+    * Surfacing the members' transitive deps DOES yield the right
+      edges (input data, base models, judge cache-warmups, etc.).
+
+    Uses ``_find_artifact_dependencies`` which unwraps ``IgnoreHash``
+    directives, so dependency-only fields (e.g. ``base_model_artifact``,
+    ``judge_model_artifact``) automatically surface.
+    """
+    from .executor import _find_artifact_dependencies
+
+    members_set = {id(m) for m in members}
+    deps: List[Artifact] = []
+    seen: set = set()
+    for member in members:
+        for attr_value in vars(member).values():
+            for dep in _find_artifact_dependencies(attr_value):
+                dep_id = id(dep)
+                if dep_id in members_set or dep_id in seen:
+                    continue
+                seen.add(dep_id)
+                deps.append(dep)
+    return deps
+
+
 class ArtifactBatch(Artifact):
     """Groups multiple artifacts to run in parallel within a single Slurm job.
 
@@ -217,21 +252,13 @@ class ArtifactBatch(Artifact):
 
     # -- dependency discovery -------------------------------------------------
 
+    def contained_artifacts(self) -> List[Artifact]:
+        """Return the member artifacts this batch produces on behalf of."""
+        return list(self._batch_artifacts)
+
     def get_direct_dependencies(self) -> List[Artifact]:
         """Return transitive dependencies of children (not the children themselves)."""
-        from .executor import _find_artifact_dependencies
-
-        children_set = set(id(a) for a in self._batch_artifacts)
-        deps: List[Artifact] = []
-        seen: set = set()
-        for child in self._batch_artifacts:
-            for attr_value in vars(child).values():
-                for dep in _find_artifact_dependencies(attr_value):
-                    dep_id = id(dep)
-                    if dep_id not in children_set and dep_id not in seen:
-                        seen.add(dep_id)
-                        deps.append(dep)
-        return deps
+        return compute_member_dependencies(self._batch_artifacts)
 
     # -- construct (parallel launcher) ----------------------------------------
 

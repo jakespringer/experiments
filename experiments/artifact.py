@@ -61,6 +61,22 @@ class Artifact:
             deps.extend(_find_artifact_dependencies(attr_value))
         return deps
 
+    def contained_artifacts(self) -> List["Artifact"]:
+        """Return artifacts that this artifact *produces* on behalf of.
+
+        Used by the executor to resolve dependency edges that target a
+        member artifact (e.g. a single ``JudgedResponses`` filtered out
+        of the active stage selection) onto the containing producer
+        (e.g. the ``BatchedJudgedResponses`` that actually writes the
+        member's output file) so Slurm ``afterok`` wiring stays correct.
+
+        Default: ``[]`` (this artifact only produces its own output).
+        Override in batched / wrapper subclasses (``ArtifactBatch``,
+        ``BatchedJudgedResponses``, ``BatchedModelResponses``) to return
+        the member artifacts whose outputs this artifact writes.
+        """
+        return []
+
     def as_dict(self) -> Dict[str, Any]:
         # Shallow extraction to preserve Artifact references
         if dataclasses.is_dataclass(self):
@@ -75,7 +91,7 @@ class Artifact:
             return cached
 
         data = self.as_dict()
-        
+
         from .executor import Directive, IgnoreHash
 
         def atom(value: Any) -> Union[str, None]:
@@ -110,6 +126,27 @@ class Artifact:
                         pairs.append(f"{k}:{v_hash}")
                 # Sort by key for deterministic hashing
                 return '{' + ','.join(sorted(pairs)) + '}'
+            # Non-Artifact dataclass instances (e.g. a config-shaped
+            # ``FinetuneStageSpec`` embedded in a parent Artifact's
+            # ``stages`` tuple): walk the fields explicitly and recurse
+            # via ``atom`` so nested Artifact references reuse their
+            # cached ``get_hash()`` values. The ``str(value)`` fallback
+            # below would otherwise expand the entire ``__repr__``
+            # subtree on every call — O(deep-repr-walk) per nested
+            # Artifact, on top of being fragile (any field whose
+            # ``__repr__`` raises flips this into a confusing
+            # ``TypeError: Unsupported value type in artifact hashing``).
+            #
+            # ``is_dataclass`` is True for both classes and instances;
+            # the ``not isinstance(value, type)`` guard keeps the branch
+            # to instances only.
+            if dataclasses.is_dataclass(value) and not isinstance(value, type):
+                pairs = []
+                for f in dataclasses.fields(value):
+                    v_hash = atom(getattr(value, f.name))
+                    if v_hash is not None:
+                        pairs.append(f"{f.name}:{v_hash}")
+                return '{' + ','.join(sorted(pairs)) + '}'
             # For other types, try str() conversion
             try:
                 return str(value)
@@ -120,8 +157,17 @@ class Artifact:
         items.sort(key=lambda kv: kv[0])
         payload = '|'.join(f"{k}={v}" for k, v in items)
         h = hashlib.sha256(payload.encode('utf-8')).hexdigest()[:10]
+        # Cache via ``object.__setattr__`` so the write succeeds on
+        # frozen dataclasses too. The bare ``setattr`` here would raise
+        # ``FrozenInstanceError`` (silently swallowed by the prior
+        # ``try/except``), meaning the cache was effectively dead for
+        # every ``@dataclass(frozen=True)`` Artifact — every call
+        # redid the full recursive walk over the dep graph. Wrapped in
+        # ``try/except`` for slotted classes whose ``__slots__`` don't
+        # include ``_experiments_hash_cache`` (rare); falling back to
+        # uncached is harmless aside from speed.
         try:
-            setattr(self, "_experiments_hash_cache", h)
+            object.__setattr__(self, "_experiments_hash_cache", h)
         except Exception:
             pass
         return h

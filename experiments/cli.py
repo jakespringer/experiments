@@ -283,6 +283,83 @@ class ExperimentCLI:
             help='Automatically batch every N artifacts within each stage to run in parallel on a single job'
         )
 
+        # runlocal command
+        runlocal_parser = subparsers.add_parser('runlocal', help='Run experiment stages locally with GPU/CPU-aware parallelism')
+        runlocal_parser.add_argument(
+            'stages',
+            nargs='*',
+            help='Stage names to run (omit for all stages)'
+        )
+        runlocal_parser.add_argument(
+            '--head',
+            type=int,
+            metavar='N',
+            help='Only run the first N artifacts'
+        )
+        runlocal_parser.add_argument(
+            '--tail',
+            type=int,
+            metavar='N',
+            help='Only run the last N artifacts'
+        )
+        runlocal_parser.add_argument(
+            '--rerun',
+            action='store_true',
+            help='Ignore exists check and rerun all artifacts'
+        )
+        runlocal_parser.add_argument(
+            '--reverse',
+            action='store_true',
+            help='Process stages in reverse order (respects dependencies)'
+        )
+        runlocal_parser.add_argument(
+            '--exclude',
+            nargs='+',
+            metavar='STAGE',
+            help='Stage names to exclude from execution'
+        )
+        runlocal_parser.add_argument(
+            '--artifact',
+            nargs='+',
+            metavar='ARTIFACT',
+            help='Artifact class names to include (filters by type)'
+        )
+        runlocal_parser.add_argument(
+            '--first-gpu',
+            type=int,
+            default=0,
+            help='First GPU index to use (default: 0)'
+        )
+        runlocal_parser.add_argument(
+            '--max-gpus',
+            type=int,
+            default=None,
+            help='Maximum number of GPUs to use (default: all detected, minus --first-gpu)'
+        )
+        runlocal_parser.add_argument(
+            '--max-cpus',
+            type=int,
+            default=None,
+            help='Maximum number of CPUs to allocate concurrently (default: os.cpu_count())'
+        )
+        runlocal_parser.add_argument(
+            '--output-dir',
+            type=str,
+            default=None,
+            help='Directory to store per-task output logs (default: /home/jspringe/slurm/local_outputs/N or temp dir)'
+        )
+        runlocal_parser.add_argument(
+            '--refresh-rate',
+            type=float,
+            default=0.1,
+            help='Dashboard refresh rate in seconds (default: 0.1)'
+        )
+        runlocal_parser.add_argument(
+            '--no-dashboard',
+            action='store_true',
+            help='Disable the live dashboard (also auto-disabled when stdout is not a TTY)'
+        )
+
         # cancel command
         cancel_parser = subparsers.add_parser('cancel', help='Cancel jobs for stages')
         cancel_parser.add_argument(
@@ -493,6 +570,22 @@ class ExperimentCLI:
                 cancel_after=getattr(args, 'cancelafter', False),
                 autobatch=getattr(args, 'autobatch', None),
             )
+        elif args.command == 'runlocal':
+            self.run_local(
+                args.stages,
+                head=getattr(args, 'head', None),
+                tail=getattr(args, 'tail', None),
+                rerun=getattr(args, 'rerun', False),
+                reverse=getattr(args, 'reverse', False),
+                exclude=getattr(args, 'exclude', None),
+                artifacts=getattr(args, 'artifact', None),
+                first_gpu=getattr(args, 'first_gpu', 0),
+                max_gpus=getattr(args, 'max_gpus', None),
+                max_cpus=getattr(args, 'max_cpus', None),
+                output_dir=getattr(args, 'output_dir', None),
+                refresh_rate=getattr(args, 'refresh_rate', 0.1),
+                no_dashboard=getattr(args, 'no_dashboard', False),
+            )
         elif args.command == 'cancel':
             self.cancel(args.stages)
         elif args.command == 'cat':
@@ -585,9 +678,11 @@ class ExperimentCLI:
             self.executor.external_dependencies = dependency or []
 
         # --- Resolve stages ---
-        selected = stages if stages else list(self.executor._stages.keys())
+        # Expand stage-group names into member stages.
+        selected = self.executor.resolve_stages(stages)
         if exclude:
-            selected = [s for s in selected if s not in exclude]
+            excluded = self.executor.expand_excluded_stages(exclude)
+            selected = [s for s in selected if s not in excluded]
         if reverse:
             selected = list(reversed(selected))
 
@@ -668,8 +763,8 @@ class ExperimentCLI:
             print("Error: No project specified in executor")
             sys.exit(1)
         
-        # Determine which stages to cancel
-        stages_to_cancel = stages if stages else list(self.executor._stages.keys())
+        # Determine which stages to cancel (expanding any stage groups)
+        stages_to_cancel = self.executor.resolve_stages(stages)
         
         print(f"Cancelling jobs for stages: {', '.join(stages_to_cancel)}")
         print()
@@ -966,6 +1061,58 @@ class ExperimentCLI:
         print(f"Use 'cat <job_id>' or 'cat <job_id>_<array_index>' to view logs")
         print("=" * 100)
     
+    def run_local(
+        self,
+        stages: List[str],
+        head: Optional[int] = None,
+        tail: Optional[int] = None,
+        rerun: bool = False,
+        reverse: bool = False,
+        exclude: Optional[List[str]] = None,
+        artifacts: Optional[List[str]] = None,
+        first_gpu: int = 0,
+        max_gpus: Optional[int] = None,
+        max_cpus: Optional[int] = None,
+        output_dir: Optional[str] = None,
+        refresh_rate: float = 0.1,
+        no_dashboard: bool = False,
+    ) -> None:
+        """Run experiment stages locally with GPU/CPU-aware DAG scheduling."""
+        from .local_executor import LocalExecutor
+
+        local_executor = LocalExecutor(
+            artifact_path=str(self.executor.artifact_path) if hasattr(self.executor, 'artifact_path') else None,
+            code_path=str(self.executor.code_path) if hasattr(self.executor, 'code_path') else None,
+            gs_path=getattr(self.executor, 'gs_path', None),
+            setup_command=getattr(self.executor, 'setup_command', None),
+            first_gpu=first_gpu,
+            max_gpus=max_gpus,
+            max_cpus=max_cpus,
+            output_dir=output_dir,
+            refresh_rate=refresh_rate,
+            no_dashboard=no_dashboard,
+        )
+        # Reuse the user's staged artifacts directly so dependency identity
+        # (id()) matches across compile_artifact / dependency resolution.
+        local_executor._stages = self.executor._stages
+        local_executor._stage_groups = self.executor._stage_groups
+
+        # Expand stage-group names; lenient expansion for --exclude.
+        selected = self.executor.resolve_stages(stages)
+        if exclude:
+            excluded = self.executor.expand_excluded_stages(exclude)
+            selected = [s for s in selected if s not in excluded]
+        if reverse:
+            selected = list(reversed(selected))
+
+        local_executor.execute(
+            selected,
+            head=head,
+            tail=tail,
+            rerun=rerun,
+            artifacts=artifacts,
+        )
+
     def print_commands(self, stages: List[str], head: Optional[int] = None, tail: Optional[int] = None, rerun: bool = False, reverse: bool = False, exclude: Optional[List[str]] = None, artifacts: Optional[List[str]] = None, jobs: Optional[int] = None) -> None:
         """Print commands to run sequentially (can be piped to bash)."""
         from .executor import PrintExecutor
@@ -978,14 +1125,16 @@ class ExperimentCLI:
         
         # Copy stage information from the SlurmExecutor
         print_executor._stages = self.executor._stages
-        
+        print_executor._stage_groups = self.executor._stage_groups
+
         # Execute stages using PrintExecutor (will print commands to stdout)
-        selected = stages if stages else list(self.executor._stages.keys())
-        
-        # Exclude specified stages
+        # Expand stage-group names; lenient expansion for --exclude.
+        selected = self.executor.resolve_stages(stages)
+
         if exclude:
-            selected = [s for s in selected if s not in exclude]
-        
+            excluded = self.executor.expand_excluded_stages(exclude)
+            selected = [s for s in selected if s not in excluded]
+
         if reverse:
             selected = list(reversed(selected))
         print_executor.execute(selected, head=head, tail=tail, rerun=rerun, artifacts=artifacts, jobs=jobs)
@@ -1013,17 +1162,18 @@ class ExperimentCLI:
         
         # Copy stage information from the SlurmExecutor
         print_executor._stages = self.executor._stages
-        
-        # Get selected stages
-        selected = stages if stages else list(self.executor._stages.keys())
-        
-        # Exclude specified stages
+        print_executor._stage_groups = self.executor._stage_groups
+
+        # Get selected stages (expanding any stage-group names).
+        selected = self.executor.resolve_stages(stages)
+
         if exclude:
-            selected = [s for s in selected if s not in exclude]
-        
+            excluded = self.executor.expand_excluded_stages(exclude)
+            selected = [s for s in selected if s not in excluded]
+
         if reverse:
             selected = list(reversed(selected))
-        
+
         # Validate and normalize stages
         selected = print_executor._validate_and_normalize_stages(selected)
         unique_artifacts = print_executor._collect_unique_artifacts()
@@ -1182,8 +1332,8 @@ class ExperimentCLI:
 
             return update, close
         
-        # Determine which stages to export
-        selected_stages = stages if stages else list(self.executor._stages.keys())
+        # Determine which stages to export (expanding any stage groups).
+        selected_stages = self.executor.resolve_stages(stages)
         
         # Build artifact-to-stages mapping
         artifact_to_stages: Dict[int, List[str]] = {}

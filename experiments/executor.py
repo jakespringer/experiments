@@ -135,9 +135,15 @@ class Task:
         """Add a command execution block to this task."""
         self.blocks.append(CommandTaskBlock(command, vargs, kwargs, vformat, kwformat, flagformat))
 
-    def upload_to_gs(self, path: str, gs_path: str, directory: bool = False, contents: bool | None = True, no_fail: bool = False) -> None:
-        """Add a Google Cloud Storage upload block to this task."""
-        self.blocks.append(UploadToGSTaskBlock(path, gs_path, directory=directory, contents=contents, no_fail=no_fail))
+    def upload_to_gs(self, path: str, gs_path: str, directory: bool = False, contents: bool | None = True, no_fail: bool = False, exclusive: bool = False) -> None:
+        """Add a Google Cloud Storage upload block to this task.
+
+        ``exclusive=True`` makes this block contend for a shared host-wide
+        upload lockfile so at most one exclusive GCS upload runs at a time.
+        Uses a distinct lock from downloads so an upload can never block a
+        download (or vice-versa).
+        """
+        self.blocks.append(UploadToGSTaskBlock(path, gs_path, directory=directory, contents=contents, no_fail=no_fail, exclusive=exclusive))
 
     def download_from_gs(self, gs_path: str, path: str, directory: bool = False, skip_existing: bool = True, contents: bool | None = True, no_fail: bool = False, exclusive: bool = False) -> None:
         """Add a Google Cloud Storage download block to this task.
@@ -159,16 +165,18 @@ class Task:
         """Add a Hugging Face model download block to this task."""
         self.blocks.append(DownloadHFModelTaskBlock(model_name, local_dir, skip_existing=skip_existing))
 
-    def rsync_to_gs(self, path: str, gs_path: str, delete: bool = False, checksum: bool = False, contents: bool | None = True, check_exists: bool = False, no_fail: bool = False, exclude: str | Sequence[str] | None = None, dry_run: bool = False, verbose: bool = True) -> None:
+    def rsync_to_gs(self, path: str, gs_path: str, delete: bool = False, checksum: bool = False, contents: bool | None = True, check_exists: bool = False, no_fail: bool = False, exclude: str | Sequence[str] | None = None, dry_run: bool = False, verbose: bool = True, exclusive: bool = False) -> None:
         """Add a Google Cloud Storage rsync upload block to this task.
 
         ``exclude`` is a Python regex (or sequence of regexes joined with ``|``)
         passed to ``gsutil rsync -x`` to skip matching paths. ``dry_run`` maps
         to ``gsutil rsync -n``. ``verbose`` defaults to True (gsutil's default
         per-file progress output); pass ``verbose=False`` to add top-level
-        ``-q`` and suppress everything but errors.
+        ``-q`` and suppress everything but errors. ``exclusive=True`` makes
+        this block contend for a shared host-wide upload lockfile so at most
+        one exclusive GCS rsync upload runs at a time.
         """
-        self.blocks.append(RsyncToGSTaskBlock(path, gs_path, delete=delete, checksum=checksum, contents=contents, check_exists=check_exists, no_fail=no_fail, exclude=exclude, dry_run=dry_run, verbose=verbose))
+        self.blocks.append(RsyncToGSTaskBlock(path, gs_path, delete=delete, checksum=checksum, contents=contents, check_exists=check_exists, no_fail=no_fail, exclude=exclude, dry_run=dry_run, verbose=verbose, exclusive=exclusive))
 
     def rsync_from_gs(self, gs_path: str, path: str, delete: bool = False, checksum: bool = False, skip_existing: bool = True, contents: bool | None = True, check_exists: bool = False, no_fail: bool = False, exclude: str | Sequence[str] | None = None, dry_run: bool = False, verbose: bool = True, exclusive: bool = False) -> None:
         """Add a Google Cloud Storage rsync download block to this task.
@@ -300,18 +308,28 @@ class UploadToGSTaskBlock(TaskBlock):
         directory: bool = False,
         contents: bool | None = True,
         no_fail: bool = False,
+        exclusive: bool = False,
     ) -> None:
         self.path = path
         self.gs_path = gs_path  # Should be gs://bucket/path format
         self.directory = directory
         self.contents = contents  # If True, add trailing slashes; if False, remove; if None, leave
         self.no_fail = no_fail
-    
+        # If True, hold the shared global GCS-upload lock so at most one
+        # exclusive upload runs concurrently on this host (strictly stronger
+        # than the per-path lock).
+        self.exclusive = exclusive
+
     def execute(self) -> str:
         """Generate a locked gsutil upload command."""
-        # Create a lockfile based on the local path to prevent concurrent access
-        path_hash = hashlib.sha256(self.path.encode("utf-8")).hexdigest()[:10]
-        lockfile = f"/tmp/{path_hash}.lock"
+        # When exclusive, take the shared global lock so only one GCS upload
+        # runs at a time host-wide; otherwise fall back to a per-path lock
+        # that only prevents races on the same local source path.
+        if self.exclusive:
+            lockfile = _GCS_UPLOAD_GLOBAL_LOCKFILE
+        else:
+            path_hash = hashlib.sha256(self.path.encode("utf-8")).hexdigest()[:10]
+            lockfile = f"/tmp/{path_hash}.lock"
 
         # Prepare source and destination paths, respecting contents flag
         source_path = self.path
@@ -412,10 +430,24 @@ class DownloadFromGSTaskBlock(TaskBlock):
         inner_parts.append(f"mv -- {dquote(tmp_dest)} {dquote(final_dest)}")
 
         base_cmd = " && ".join(inner_parts)
-        # On failure, remove the staging path and propagate the failure
+        # On failure, remove the staging path and propagate the failure.
+        #
+        # Note: we intentionally do NOT capture the exit code into a shell
+        # variable here. The whole ``guarded_cmd`` gets wrapped in
+        # ``flock -c dquote(guarded_cmd)``, and ``dquote`` does not escape
+        # ``$`` (by design — it wants ``$VAR`` expansions to work for
+        # other callers). That means any ``$rc`` / ``$?`` here would be
+        # expanded by the OUTER shell (which runs with ``set -u`` per
+        # the top-level script emitted by experiments/cli.py), not by the
+        # inner shell spawned by flock — producing a spurious
+        # ``rc: unbound variable`` error at parse time.
+        #
+        # Using a literal ``false`` at the end of the cleanup branch
+        # preserves the failure signal (``set -e`` in the outer script
+        # propagates it) without requiring any variable indirection.
         guarded_cmd = (
             f"{{ {base_cmd}; }} || "
-            f"{{ rc=$?; rm -rf -- {dquote(tmp_dest)}; exit $rc; }}"
+            f"{{ rm -rf -- {dquote(tmp_dest)}; false; }}"
         )
 
         # Wrap entire command in flock; when skip_existing is enabled, guard it with an
@@ -546,6 +578,12 @@ class DownloadHFModelTaskBlock(TaskBlock):
 # the host (regardless of local destination path).
 _GCS_DOWNLOAD_GLOBAL_LOCKFILE = "/tmp/gcs_download.global.lock"
 
+# Companion lockfile for single-flight GCS uploads. Distinct from the
+# download lock above so that an exclusive upload never blocks an exclusive
+# download (and vice-versa): they share neither the outbound bandwidth path
+# nor the staging behavior, so coupling them would only add latency.
+_GCS_UPLOAD_GLOBAL_LOCKFILE = "/tmp/gcs_upload.global.lock"
+
 
 def _build_exclude_pattern(exclude: str | Sequence[str] | None) -> str | None:
     """Combine one or more regex patterns into a single gsutil ``-x`` argument.
@@ -582,6 +620,7 @@ class RsyncToGSTaskBlock(TaskBlock):
         exclude: str | Sequence[str] | None = None,
         dry_run: bool = False,
         verbose: bool = True,
+        exclusive: bool = False,
     ) -> None:
         self.path = path
         self.gs_path = gs_path  # Should be gs://bucket/path format
@@ -593,12 +632,19 @@ class RsyncToGSTaskBlock(TaskBlock):
         self.exclude = exclude  # Regex (or list of regexes) passed to gsutil rsync -x
         self.dry_run = dry_run  # If True, run gsutil rsync in dry-run mode (-n)
         self.verbose = verbose  # If False, pass top-level -q to gsutil (errors only)
+        # If True, hold the shared global GCS-upload lock so at most one
+        # exclusive rsync upload runs concurrently on this host.
+        self.exclusive = exclusive
 
     def execute(self) -> str:
         """Generate a locked gsutil rsync command."""
-        # Create a lockfile based on the local path to prevent concurrent access
-        path_hash = hashlib.sha256(self.path.encode("utf-8")).hexdigest()[:10]
-        lockfile = f"/tmp/{path_hash}.lock"
+        # When exclusive, take the shared global upload lock so only one GCS
+        # upload runs at a time host-wide; otherwise use a per-path lock.
+        if self.exclusive:
+            lockfile = _GCS_UPLOAD_GLOBAL_LOCKFILE
+        else:
+            path_hash = hashlib.sha256(self.path.encode("utf-8")).hexdigest()[:10]
+            lockfile = f"/tmp/{path_hash}.lock"
 
         # Handle trailing slashes based on contents parameter
         source_path = self.path
@@ -720,17 +766,36 @@ class RsyncFromGSTaskBlock(TaskBlock):
             dest_path = dest_path.rstrip('/')
         # If contents is None, leave paths as-is
 
-        # Build the core inner command (remote checks + mkdir + rsync)
+        # Build the core inner command (remote checks + mkdir + rsync).
+        #
+        # Cleanup-on-failure semantics:
+        #   * The whole sequence runs under the ``flock -x`` below (keyed on
+        #     the target path, or on the host-wide GCS lock when
+        #     ``exclusive=True``), so concurrent rsyncs for the same target
+        #     serialize — the pre-existence check + mkdir + rsync + cleanup
+        #     form one atomic unit versus any other caller of this block.
+        #   * ``__pre`` records whether the target existed *before* our
+        #     mkdir. On rsync failure we ``rm -rf`` the target only when
+        #     ``__pre=0``, so we never clobber pre-existing content.
+        #   * Cleanup is nested inside the rsync command's ``|| {...}``,
+        #     which is itself braced and chained via ``&&`` after
+        #     check_exists / mkdir. So a ``check_exists`` or ``mkdir``
+        #     failure short-circuits the chain *before* the cleanup block
+        #     is reachable; cleanup fires only when rsync itself fails.
         inner_parts: List[str] = []
 
         # If check_exists is enabled, check if the remote path exists
         if self.check_exists:
             inner_parts.append(f"gsutil -q ls {dquote(source_path)} > /dev/null 2>&1")
 
-        # Create necessary directory before sync
-        # Use the original path (without trailing slash) for mkdir
+        # Capture pre-existence (under the flock) so we can decide whether
+        # to clean up on failure. ``-e`` matches files and directories.
         target_path = self.path.rstrip('/')
-        inner_parts.append(f"mkdir -p -- {dquote(target_path)}")
+        target_path_q = dquote(target_path)
+        inner_parts.append(
+            f"{{ if [ -e {target_path_q} ]; then __pre=1; else __pre=0; fi; }}"
+        )
+        inner_parts.append(f"mkdir -p -- {target_path_q}")
 
         # Build the gsutil rsync command
         # -r for recursive sync, -m for parallel operations.
@@ -755,13 +820,32 @@ class RsyncFromGSTaskBlock(TaskBlock):
         gsutil_cmd_parts.extend([dquote(source_path), dquote(dest_path)])
         gsutil_cmd = " ".join(gsutil_cmd_parts)
 
-        inner_parts.append(gsutil_cmd)
+        # Wrap rsync so that its failure — and only its failure — triggers
+        # cleanup of the target when ``__pre=0``. The ``|| {...}`` clause
+        # is nested inside braces bound to ``gsutil``, so prior-step
+        # failures never reach it via the outer ``&&`` chain.
+        rsync_with_cleanup = (
+            f"{{ {gsutil_cmd} || "
+            f"{{ __rc=$?; "
+            f"if [ \"$__pre\" = \"0\" ]; then rm -rf -- {target_path_q}; fi; "
+            f"exit $__rc; }}; }}"
+        )
+        inner_parts.append(rsync_with_cleanup)
 
         base_cmd = " && ".join(inner_parts)
 
         # Wrap entire command in flock; when skip_existing is enabled, guard it with an
         # if/else block so only a pre-existing local path causes a skip. Remote
         # existence checks still run inside the guarded section when configured.
+        #
+        # Quote the flock ``-c`` argument with ``shquote`` (single quotes),
+        # not ``dquote``. The inner script references ``$__pre`` / ``$__rc``
+        # defined inside the ``sh -c`` subshell; under ``dquote`` the outer
+        # shell (running with ``set -u``) would try to expand them at parse
+        # time and die with ``__pre: unbound variable``. Single-quoting
+        # passes the script verbatim to flock → ``sh -c`` where the vars
+        # are in scope. The inner script is self-contained and never needs
+        # outer-shell variable expansion, so this is safe.
         if self.skip_existing:
             script_lines = [
                 f"if [ ! -e {dquote(target_path)} ]; then",
@@ -771,9 +855,9 @@ class RsyncFromGSTaskBlock(TaskBlock):
                 "fi",
             ]
             inner_script = "\n".join(script_lines)
-            locked_cmd = f"flock -x {dquote(lockfile)} -c {dquote(inner_script)}"
+            locked_cmd = f"flock -x {dquote(lockfile)} -c {shquote(inner_script)}"
         else:
-            locked_cmd = f"flock -x {dquote(lockfile)} -c {dquote(base_cmd)}"
+            locked_cmd = f"flock -x {dquote(lockfile)} -c {shquote(base_cmd)}"
 
         cmd = locked_cmd
         if self.check_exists and not self.skip_existing:
@@ -812,10 +896,21 @@ def _is_raw_block(block: TaskBlock) -> bool:
 
 def _find_artifact_dependencies(value: Any) -> Iterable[Artifact]:
     """Recursively find all Artifact instances within a data structure.
-    
+
     This traverses dictionaries, lists, tuples, sets, and ArtifactSets to discover
     artifact dependencies declared in artifact attributes.
+
+    ``IgnoreHash`` wrappers are unwrapped before recursion: the wrapper
+    hides values from ``Artifact.get_hash()`` (so identity-irrelevant
+    fields like a cache-warmup dependency don't affect digests), but
+    the underlying value may still be an ``Artifact`` whose dep edge
+    we want the executor to see.
     """
+    if isinstance(value, IgnoreHash):
+        # Recurse on the wrapped value so dependency-only ``IgnoreHash``
+        # fields still surface their inner artifacts to the executor.
+        yield from _find_artifact_dependencies(value())
+        return
     if isinstance(value, Artifact):
         yield value
     elif isinstance(value, ArtifactSet):
@@ -957,17 +1052,97 @@ class Executor:
 
     def __init__(self) -> None:
         self._stages: Dict[str, List[Artifact]] = {}
+        self._stage_groups: Dict[str, List[str]] = {}
         self._verbose_filtering: bool = True  # Whether to print filter messages
 
     def stage(self, name: str, artifacts: Iterable[Artifact] | ArtifactSet) -> None:
         """Register a named stage containing artifacts to execute.
-        
+
         Accepts a single `Artifact`, an `ArtifactSet`, or any iterable of `Artifact`s.
         A single `Artifact` is wrapped into an `ArtifactSet` for consistency.
         """
+        if name in self._stage_groups:
+            raise ValueError(
+                f"Cannot register stage '{name}': name is already a stage group"
+            )
         if isinstance(artifacts, Artifact):
             artifacts = ArtifactSet([artifacts])
         self._stages[name] = list(artifacts)
+
+    def stage_group(self, name: str, stages: Iterable[str]) -> None:
+        """Register a named group of stages.
+
+        Selecting the group on any CLI command (``launch``, ``runlocal``,
+        ``print``, ``printlines``, ``cancel``, ``export``, ...) is equivalent
+        to selecting every member stage. Members may be other stage groups;
+        expansion is recursive and order-preserving (first occurrence wins).
+
+        Group names share the same namespace as stage names — a group cannot
+        collide with an existing stage.
+        """
+        if name in self._stages:
+            raise ValueError(
+                f"Cannot register stage group '{name}': name is already a stage"
+            )
+        self._stage_groups[name] = list(stages)
+
+    def _resolve_stage_names(
+        self,
+        names: Iterable[str],
+        strict: bool = True,
+    ) -> List[str]:
+        """Expand stage and stage-group names to a deduplicated list of stages.
+
+        Group expansion is recursive; cycles raise ``ValueError``. With
+        ``strict=False``, names that match neither a stage nor a group pass
+        through unchanged (used for ``--exclude`` so typos don't crash but
+        groups still expand).
+        """
+        result: List[str] = []
+        seen: Set[str] = set()
+
+        def walk(n: str, stack: Set[str]) -> None:
+            if n in stack:
+                raise ValueError(
+                    f"Cycle detected in stage groups involving '{n}'"
+                )
+            if n in self._stage_groups:
+                new_stack = stack | {n}
+                for sub in self._stage_groups[n]:
+                    walk(sub, new_stack)
+                return
+            if n in self._stages:
+                if n not in seen:
+                    seen.add(n)
+                    result.append(n)
+                return
+            if strict:
+                raise ValueError(f"Unknown stage or stage group: '{n}'")
+            if n not in seen:
+                seen.add(n)
+                result.append(n)
+
+        for name in names:
+            walk(name, set())
+        return result
+
+    def resolve_stages(self, stages: Iterable[str]) -> List[str]:
+        """Resolve user-provided stage / group selection into stage names.
+
+        Empty input returns all registered stages in insertion order.
+        """
+        names = list(stages) if stages else []
+        if not names:
+            return list(self._stages.keys())
+        return self._resolve_stage_names(names, strict=True)
+
+    def expand_excluded_stages(self, names: Iterable[str]) -> Set[str]:
+        """Expand stage / group names for ``--exclude``.
+
+        Lenient: unknown names pass through unchanged (so a typo just
+        becomes a no-op, matching pre-group behavior).
+        """
+        return set(self._resolve_stage_names(list(names) if names else [], strict=False))
 
     def auto_cli(self) -> None:
         """Parse command-line arguments and execute selected stages."""
@@ -1072,14 +1247,12 @@ class Executor:
         self.launch(task_tiers, tier_to_stages=tier_to_stages, jobs=jobs)
 
     def _validate_and_normalize_stages(self, stages: List[str]) -> List[str]:
-        """Validate stage names and return normalized list (all stages if empty)."""
-        if stages:
-            unknown = [s for s in stages if s not in self._stages]
-            if unknown:
-                raise ValueError(f"Unknown stage(s): {unknown}")
-            return stages
-        else:
-            return list(self._stages.keys())
+        """Validate stage / group names and return a flat list of stage names.
+
+        Empty input returns all registered stages. Stage groups are expanded
+        recursively into their member stages.
+        """
+        return self.resolve_stages(stages)
 
     def _collect_unique_artifacts(self) -> List[Artifact]:
         """Collect all artifacts from all stages, deduplicated by identity."""
@@ -1332,13 +1505,13 @@ class Executor:
         """
         # Build a reverse lookup: child artifact id → containing batch id.
         # This enables dependency resolution after autobatching absorbs
-        # children into batches.
-        from .batch import ArtifactBatch
+        # children into batches, AND for batched-producer artifacts (e.g.
+        # ``BatchedJudgedResponses``, ``BatchedModelResponses``) whose
+        # members are filtered out of the active stage selection.
         child_to_batch: Dict[int, int] = {}
         for a in artifacts:
-            if isinstance(a, ArtifactBatch):
-                for child in a._batch_artifacts:
-                    child_to_batch[id(child)] = id(a)
+            for child in a.contained_artifacts():
+                child_to_batch[id(child)] = id(a)
 
         for artifact in artifacts:
             artifact_id = id(artifact)
@@ -1862,28 +2035,57 @@ class SlurmExecutor(Executor):
         artifact_to_job_id: Dict[int, str],
     ) -> List[str]:
         """Compute the set of job IDs that these tasks depend on.
-        
+
         Args:
             tasks: List of tasks to compute dependencies for
             artifact_to_job_id: Mapping of artifact IDs to job IDs that produce them
-        
+
         Returns:
             Sorted list of unique job IDs that these tasks depend on
         """
         dependency_job_ids: Set[str] = set()
-        
+
+        # Build a child→batch resolution map across all artifacts known
+        # to the executor. When a task's direct dependency was filtered
+        # out of the active stage selection (no entry in
+        # ``artifact_to_job_id``) but a containing batched producer
+        # *is* in the plan, retarget the Slurm afterok edge to that
+        # producer. Without this, the per-member individual sitting
+        # in a ``..._individual`` stage that's omitted from the
+        # active stage_group leaves downstream artifacts wired to
+        # nothing and racing the batched job.
+        all_artifacts = self._collect_unique_artifacts()
+        member_to_producer: Dict[int, int] = {}
+        for a in all_artifacts:
+            for child in a.contained_artifacts():
+                member_to_producer[id(child)] = id(a)
+
         for task in tasks:
             if task.artifact is None:
                 continue
-            
-            # Find all artifacts this task depends on
-            for attr_value in vars(task.artifact).values():
-                for dependency in _find_artifact_dependencies(attr_value):
-                    dependency_id = id(dependency)
-                    # If we've already submitted a job for this dependency, add it
-                    if dependency_id in artifact_to_job_id:
-                        dependency_job_ids.add(artifact_to_job_id[dependency_id])
-        
+
+            # Use the artifact's own ``get_direct_dependencies`` so that
+            # subclasses (e.g. ``ArtifactBatch``, ``BatchedJudgedResponses``)
+            # which legitimately *write* to artifacts they don't *read* — and
+            # therefore override the default vars-walking behavior to point
+            # the dependency edges at their true read-side inputs — actually
+            # take effect for Slurm dependency wiring too. Walking
+            # ``vars(task.artifact).values()`` inline here would silently
+            # bypass those overrides and wire deps to the WRONG artifacts,
+            # causing race conditions when the override-targeted upstreams
+            # aren't in the run plan.
+            for dependency in task.artifact.get_direct_dependencies():
+                dependency_id = id(dependency)
+                # If we've already submitted a job for this dependency, add it
+                if dependency_id in artifact_to_job_id:
+                    dependency_job_ids.add(artifact_to_job_id[dependency_id])
+                    continue
+                # Otherwise, fall back to the batched producer if one
+                # is registered and has been submitted.
+                producer_id = member_to_producer.get(dependency_id)
+                if producer_id is not None and producer_id in artifact_to_job_id:
+                    dependency_job_ids.add(artifact_to_job_id[producer_id])
+
         return sorted(dependency_job_ids)
     
     def _determine_group_stage(self, tasks: List[Task], stage_names: List[str]) -> str | None:

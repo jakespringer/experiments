@@ -23,7 +23,6 @@ from datetime import datetime, timedelta
 from enum import Enum
 from typing import Optional
 from collections import deque
-import torch
 
 from rich.console import Console, Group
 from rich.live import Live
@@ -296,10 +295,11 @@ class Dashboard:
         self.completed_scroll_top = 0
 
     def _running_panel_size(self) -> int:
-        """Dynamic size for the running panel based on num_parallel."""
-        needed = self.num_parallel + 3  # 2 borders + 1 header + num_parallel rows
+        """Dynamic size for the running panel based on num_parallel, with a floor of 4 rows."""
+        min_rows = 4
+        needed = max(self.num_parallel, min_rows) + 3  # 2 borders + 1 header + rows
         max_size = max((self.console.size.height - 13) // 2, 5)
-        return max(4, min(needed, max_size))
+        return max(min_rows + 3, min(needed, max_size))
 
     def _visible_rows(self, panel: str) -> int:
         """Number of job rows visible in a panel (excluding borders and header)."""
@@ -913,6 +913,7 @@ def main():
 
     if args.gpus > 0:
         try:
+            import torch  # type: ignore
             available_gpus = torch.cuda.device_count()
         except Exception:
             available_gpus = 0
